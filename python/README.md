@@ -19,6 +19,14 @@ cactus build --python
 ```
 <!-- --8<-- [end:install] -->
 
+For Raspberry Pi 4 (ARMv8.0), use:
+
+```bash
+CACTUS_CMAKE_ARGS="-DCACTUS_ARM_BASELINE=armv8-a+simd+fp16 -DCACTUS_ENABLE_I8MM=OFF -DENABLE_SME2=OFF" cactus build --python
+```
+
+If your device does not expose `asimdhp` in `/proc/cpuinfo`, local FP16 kernels are not supported.
+
 ```bash
 # Download models (CLI)
 cactus download LiquidAI/LFM2-VL-450M

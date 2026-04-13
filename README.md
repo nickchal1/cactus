@@ -284,6 +284,18 @@ graph.hard_reset();
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### Raspberry Pi 4 (ARMv8.0) build
+
+The default Cactus baseline is optimized for ARMv8.2+ CPUs.  
+For Raspberry Pi 4, build with a lower baseline and disable I8MM:
+
+```bash
+CACTUS_CMAKE_ARGS="-DCACTUS_ARM_BASELINE=armv8-a+simd+fp16 -DCACTUS_ENABLE_I8MM=OFF -DENABLE_SME2=OFF" cactus build
+CACTUS_CMAKE_ARGS="-DCACTUS_ARM_BASELINE=armv8-a+simd+fp16 -DCACTUS_ENABLE_I8MM=OFF -DENABLE_SME2=OFF" cactus build --python
+```
+
+If your CPU/OS does not expose FP16 vector arithmetic (`asimdhp`), on-device Cactus kernels are not supported on that device.
+
 ## Maintaining Organisations
 
 1. [Cactus Compute, Inc. (YC S25)](https://cactuscompute.com/)

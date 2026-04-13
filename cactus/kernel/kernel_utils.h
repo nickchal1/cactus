@@ -6,9 +6,11 @@
 #include <TargetConditionals.h>
 #include <sys/sysctl.h>
 #endif
-#if defined(__ANDROID__)
+#if defined(__linux__)
 #include <sys/auxv.h>
 #include <asm/hwcap.h>
+#endif
+#if defined(__ANDROID__)
 #include <sched.h>
 #include <fstream>
 #endif
@@ -54,7 +56,7 @@ inline bool cpu_has_i8mm() {
     std::call_once(once, []() {
 #if defined(__APPLE__)
     has = true;
-#elif defined(__ANDROID__)
+#elif defined(__ANDROID__) || defined(__linux__)
     unsigned long hwcap2 = getauxval(AT_HWCAP2);
     #ifndef HWCAP2_I8MM
     #define HWCAP2_I8MM (1 << 13)
@@ -83,7 +85,7 @@ inline bool cpu_has_sme2() {
 		has = ret == 1;
 	}
 
-#elif defined(__ANDROID__)
+#elif defined(__ANDROID__) || defined(__linux__)
 	unsigned long hwcap2 = getauxval(AT_HWCAP2);
 #ifdef HWCAP2_SME2
 	has = (hwcap2 & HWCAP2_SME2) != 0;

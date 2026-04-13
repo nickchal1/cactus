@@ -24,6 +24,9 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CACTUS_CURL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../libs/curl" CACHE PATH "Path to vendored libcurl artifacts")
+set(CACTUS_ARM_BASELINE "armv8.2-a+fp16+simd+dotprod" CACHE STRING "AArch64 baseline ISA used for core kernels")
+set(CACTUS_ENABLE_I8MM "AUTO" CACHE STRING "I8MM build mode: AUTO, ON, or OFF")
+set_property(CACHE CACTUS_ENABLE_I8MM PROPERTY STRINGS AUTO ON OFF)
 
 function(cactus_require_vendored_curl include_dir library_path platform_label)
     if(NOT EXISTS "${include_dir}/curl/curl.h" OR NOT EXISTS "${library_path}")
@@ -39,14 +42,8 @@ endfunction()
 
 if(APPLE)
     set(CMAKE_OSX_ARCHITECTURES "arm64")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -arch arm64 -march=armv8.2-a+fp16+simd+dotprod+i8mm -pthread -Wall -Wextra -pedantic -O3 -Wno-missing-field-initializers")
-    add_compile_definitions(
-        __ARM_NEON=1
-        __ARM_FEATURE_FP16_VECTOR_ARITHMETIC=1
-        __ARM_FEATURE_DOTPROD=1
-        __ARM_FEATURE_MATMUL_INT8=1
-        ACCELERATE_NEW_LAPACK
-    )
+    set(CACTUS_ARCH_FLAGS "-arch arm64 -march=${CACTUS_ARM_BASELINE}")
+    add_compile_definitions(ACCELERATE_NEW_LAPACK)
 
     enable_language(OBJCXX)
     set(CACTUS_CURL_INCLUDE_DIR "${CACTUS_CURL_ROOT}/include")
@@ -59,14 +56,11 @@ if(APPLE)
     find_library(SYSTEMCONFIGURATION_FRAMEWORK SystemConfiguration REQUIRED)
     find_library(CFNETWORK_FRAMEWORK CFNetwork REQUIRED)
 else()
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv8.2-a+fp16+simd+dotprod+i8mm -pthread -Wall -Wextra -pedantic -O3 -Wno-missing-field-initializers")
-    add_compile_definitions(
-        __ARM_NEON=1
-        __ARM_FEATURE_FP16_VECTOR_ARITHMETIC=1
-        __ARM_FEATURE_DOTPROD=1
-        __ARM_FEATURE_MATMUL_INT8=1
-    )
+    set(CACTUS_ARCH_FLAGS "-march=${CACTUS_ARM_BASELINE}")
 endif()
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CACTUS_ARCH_FLAGS} -pthread -Wall -Wextra -pedantic -O3 -Wno-missing-field-initializers")
+message(STATUS "Cactus ARM baseline ISA: ${CACTUS_ARM_BASELINE}")
 
 file(GLOB ENGINE_SOURCES "engine/*.cpp")
 file(GLOB GRAPH_SOURCES "graph/*.cpp")
@@ -143,12 +137,12 @@ endfunction()
 
 set(ENABLE_SME2 "AUTO" CACHE STRING "SME2 build mode: AUTO or OFF")
 set_property(CACHE ENABLE_SME2 PROPERTY STRINGS AUTO OFF)
+include(CheckCXXSourceCompiles)
 
 set(BUILD_SME2 0)
 set(SME2_MARCH_FLAG "-march=armv9.2-a+nosve+nosve2+sme2")
 if(ENABLE_SME2 STREQUAL "AUTO")
 	if(APPLE AND CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
-		include(CheckCXXSourceCompiles)
 		set(CMAKE_REQUIRED_FLAGS "-arch arm64 ${SME2_MARCH_FLAG}")
 		check_cxx_source_compiles("
 			#include <arm_sme.h>
@@ -178,21 +172,60 @@ if(BUILD_SME2)
 endif()
 
 # I8MM support: compile kernel_i8mm.cpp with +i8mm
+set(BUILD_I8MM 0)
 set(I8MM_MARCH_FLAG "-march=armv8.2-a+fp16+simd+dotprod+i8mm")
-add_library(cactus_i8mm_obj OBJECT ${I8MM_SOURCE})
-target_include_directories(cactus_i8mm_obj PRIVATE ${COMMON_INCLUDES})
-target_compile_options(cactus_i8mm_obj PRIVATE ${I8MM_MARCH_FLAG})
-set_target_properties(cactus_i8mm_obj PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_compile_definitions(cactus_i8mm_obj PRIVATE CACTUS_COMPILE_I8MM __ARM_FEATURE_MATMUL_INT8=1)
+if(CACTUS_ENABLE_I8MM STREQUAL "OFF")
+    message(STATUS "I8MM disabled by CACTUS_ENABLE_I8MM=OFF")
+else()
+    if(APPLE AND CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
+        set(CMAKE_REQUIRED_FLAGS "-arch arm64 ${I8MM_MARCH_FLAG}")
+    else()
+        set(CMAKE_REQUIRED_FLAGS "${I8MM_MARCH_FLAG}")
+    endif()
+    check_cxx_source_compiles("
+        #include <arm_neon.h>
+        int main() {
+        #ifndef __ARM_FEATURE_MATMUL_INT8
+        #error \"I8MM not enabled\"
+        #endif
+            int8x16_t a = vdupq_n_s8(0);
+            int8x16_t b = vdupq_n_s8(0);
+            int32x4_t c = vdupq_n_s32(0);
+            c = vmmlaq_s32(c, a, b);
+            (void)c;
+            return 0;
+        }
+    " COMPILER_SUPPORTS_I8MM)
+    unset(CMAKE_REQUIRED_FLAGS)
 
-set(EXTRA_OBJECTS $<TARGET_OBJECTS:cactus_i8mm_obj>)
+    if(COMPILER_SUPPORTS_I8MM)
+        set(BUILD_I8MM 1)
+        message(STATUS "Toolchain supports I8MM - building I8MM kernels")
+    elseif(CACTUS_ENABLE_I8MM STREQUAL "ON")
+        message(FATAL_ERROR "CACTUS_ENABLE_I8MM=ON but toolchain does not support I8MM")
+    else()
+        message(STATUS "Toolchain does not support I8MM - building without I8MM kernels")
+    endif()
+endif()
+
+set(EXTRA_OBJECTS)
+if(BUILD_I8MM)
+    add_library(cactus_i8mm_obj OBJECT ${I8MM_SOURCE})
+    target_include_directories(cactus_i8mm_obj PRIVATE ${COMMON_INCLUDES})
+    target_compile_options(cactus_i8mm_obj PRIVATE ${I8MM_MARCH_FLAG})
+    set_target_properties(cactus_i8mm_obj PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_compile_definitions(cactus_i8mm_obj PRIVATE CACTUS_COMPILE_I8MM)
+    list(APPEND EXTRA_OBJECTS $<TARGET_OBJECTS:cactus_i8mm_obj>)
+endif()
 if(BUILD_SME2)
-	set(EXTRA_OBJECTS ${EXTRA_OBJECTS} $<TARGET_OBJECTS:cactus_sme2_obj>)
+	list(APPEND EXTRA_OBJECTS $<TARGET_OBJECTS:cactus_sme2_obj>)
 endif()
 
 add_library(cactus STATIC ${COMMON_SOURCES} ${EXTRA_OBJECTS})
 configure_cactus_target(cactus)
-target_compile_definitions(cactus PRIVATE CACTUS_COMPILE_I8MM)
+if(BUILD_I8MM)
+	target_compile_definitions(cactus PRIVATE CACTUS_COMPILE_I8MM)
+endif()
 
 if(BUILD_SME2)
 	target_compile_definitions(cactus PRIVATE CACTUS_COMPILE_SME2)
@@ -204,7 +237,9 @@ set_target_properties(cactus_ffi PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     OUTPUT_NAME "cactus"
 )
-target_compile_definitions(cactus_ffi PRIVATE CACTUS_COMPILE_I8MM)
+if(BUILD_I8MM)
+	target_compile_definitions(cactus_ffi PRIVATE CACTUS_COMPILE_I8MM)
+endif()
 
 if(BUILD_SME2)
 	target_compile_definitions(cactus_ffi PRIVATE CACTUS_COMPILE_SME2)
