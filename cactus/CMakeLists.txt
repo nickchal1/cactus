@@ -62,6 +62,32 @@ endif()
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CACTUS_ARCH_FLAGS} -pthread -Wall -Wextra -pedantic -O3 -Wno-missing-field-initializers")
 message(STATUS "Cactus ARM baseline ISA: ${CACTUS_ARM_BASELINE}")
 
+# GCC 13 arm_neon.h declares fp16 arithmetic intrinsics with an internal
+# target attribute of "arch=armv8.2-a+fp16".  When the global baseline is
+# armv8-a (Raspberry Pi 4 compat profile), the ISA levels differ and GCC
+# refuses to inline the always_inline intrinsics ("target specific option
+# mismatch").  Fix: compile only the kernel FP16 sources at armv8.2-a+fp16+simd
+# by appending a file-level override (last -march wins in GCC/Clang).
+# Non-kernel files (which may use std::atomic) keep the armv8-a baseline to
+# avoid emitting LSE atomic instructions that would SIGILL on Cortex-A72.
+if(NOT APPLE AND CACTUS_ARM_BASELINE MATCHES "^armv8-a" AND CACTUS_ARM_BASELINE MATCHES "fp16")
+    set(KERNEL_FP16_MARCH "-march=armv8.2-a+fp16+simd")
+    set(KERNEL_FP16_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/kernel/kernel_attention.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/kernel/kernel_bilstm.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/kernel/kernel_blas.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/kernel/kernel_conv.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/kernel/kernel_lstm.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/kernel/kernel_nn.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/kernel/kernel_scalar.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/kernel/kernel_matmul.cpp"
+    )
+    set_source_files_properties(${KERNEL_FP16_SOURCES} PROPERTIES
+        COMPILE_FLAGS "${KERNEL_FP16_MARCH}"
+    )
+    message(STATUS "Pi 4 compat: kernel FP16 sources compiled at armv8.2-a+fp16+simd")
+endif()
+
 file(GLOB ENGINE_SOURCES "engine/*.cpp")
 file(GLOB GRAPH_SOURCES "graph/*.cpp")
 file(GLOB KERNEL_SOURCES "kernel/*.cpp")
