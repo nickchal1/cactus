@@ -90,10 +90,11 @@ if(NOT APPLE)
     # Disable auto-vectorization here so GCC doesn't opportunistically emit FP16
     # vector arithmetic in scalar fallback code paths on ARMv8.0 CPUs.
     set(KERNEL_FP16_MARCH_FLAG "-march=armv8.2-a+fp16+simd")
-    set(KERNEL_FP16_COMPILE_OPTIONS
-        "${KERNEL_FP16_MARCH_FLAG}"
-        "-fno-tree-vectorize"
-        "-fno-slp-vectorize")
+    set(KERNEL_FP16_COMPILE_OPTIONS "${KERNEL_FP16_MARCH_FLAG}")
+    list(APPEND KERNEL_FP16_COMPILE_OPTIONS "-fno-tree-vectorize")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")
+        list(APPEND KERNEL_FP16_COMPILE_OPTIONS "-fno-slp-vectorize")
+    endif()
     foreach(_kernel_src ${KERNEL_SOURCES})
         set_source_files_properties(${_kernel_src} PROPERTIES COMPILE_OPTIONS "${KERNEL_FP16_COMPILE_OPTIONS}")
     endforeach()
