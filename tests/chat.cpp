@@ -363,6 +363,10 @@ int main(int argc, char* argv[]) {
 
     if (!model) {
         std::cerr << colored("Failed to initialize model\n", Color::RED + Color::BOLD);
+        const char* init_error = cactus_get_last_error();
+        if (init_error && init_error[0] != '\0') {
+            std::cerr << colored("Details: ", Color::YELLOW + Color::BOLD) << init_error << "\n";
+        }
         return 1;
     }
 

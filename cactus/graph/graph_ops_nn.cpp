@@ -1,4 +1,5 @@
 #include "graph.h"
+#include "fp16_fallback.h"
 #include "../kernel/kernel.h"
 #include "../kernel/kernel_utils.h"
 #include <cstring>
@@ -11,6 +12,10 @@
 #include <limits>
 
 namespace {
+    inline bool has_fp16_vec() {
+        return cpu_has_fp16_vector_arithmetic();
+    }
+
     thread_local std::vector<__fp16> transpose_buffer_fp16;
     thread_local std::vector<int8_t> quant_activation_buffer;
     thread_local std::vector<float> quant_scales_buffer;
@@ -41,25 +46,34 @@ namespace {
         }
 
         constexpr size_t PARALLEL_THRESHOLD = 16;
+        const bool use_vec = has_fp16_vec();
 
         if (M >= PARALLEL_THRESHOLD) {
             CactusThreading::parallel_for(M, CactusThreading::Thresholds::ELEMENT_WISE,
-                [src, dst, scales, K](size_t m_start, size_t m_end) {
+                [src, dst, scales, K, use_vec](size_t m_start, size_t m_end) {
                     for (size_t m = m_start; m < m_end; m++) {
-                        float max_abs = cactus_fp16_max_abs(src + m * K, K);
-                        float scale = max_abs / 127.0f;
-                        if (scale < 1e-10f) scale = 1e-10f;
-                        scales[m] = scale;
-                        cactus_fp16_to_int8(src + m * K, dst + m * K, K, scale);
+                        if (use_vec) {
+                            float max_abs = cactus_fp16_max_abs(src + m * K, K);
+                            float scale = max_abs / 127.0f;
+                            if (scale < 1e-10f) scale = 1e-10f;
+                            scales[m] = scale;
+                            cactus_fp16_to_int8(src + m * K, dst + m * K, K, scale);
+                        } else {
+                            scales[m] = Fp16Fallback::quantize_row_fp16_to_int8(src + m * K, dst + m * K, K);
+                        }
                     }
                 });
         } else {
             for (size_t m = 0; m < M; m++) {
-                float max_abs = cactus_fp16_max_abs(src + m * K, K);
-                float scale = max_abs / 127.0f;
-                if (scale < 1e-10f) scale = 1e-10f;
-                scales[m] = scale;
-                cactus_fp16_to_int8(src + m * K, dst + m * K, K, scale);
+                if (use_vec) {
+                    float max_abs = cactus_fp16_max_abs(src + m * K, K);
+                    float scale = max_abs / 127.0f;
+                    if (scale < 1e-10f) scale = 1e-10f;
+                    scales[m] = scale;
+                    cactus_fp16_to_int8(src + m * K, dst + m * K, K, scale);
+                } else {
+                    scales[m] = Fp16Fallback::quantize_row_fp16_to_int8(src + m * K, dst + m * K, K);
+                }
             }
         }
 
@@ -74,7 +88,14 @@ namespace {
         }
         if (buffer.precision == Precision::FP32) {
             scratch.resize(buffer.total_size);
-            cactus_fp32_to_fp16(buffer.data_as<float>(), scratch.data(), buffer.total_size);
+            if (has_fp16_vec()) {
+                cactus_fp32_to_fp16(buffer.data_as<float>(), scratch.data(), buffer.total_size);
+            } else {
+                const float* src = buffer.data_as<float>();
+                for (size_t i = 0; i < buffer.total_size; ++i) {
+                    Fp16Fallback::store_fp16(scratch.data() + i, src[i]);
+                }
+            }
             return scratch.data();
         }
         throw std::runtime_error("GATED_DELTANET unsupported precision (expected FP16/FP32)");
@@ -171,25 +192,34 @@ void compute_quantize_activations_node(GraphNode& node, const std::vector<std::u
     float* scales = node.output_buffer.activation_scales_as_float();
 
     constexpr size_t PARALLEL_THRESHOLD = 16;
+    const bool use_vec = has_fp16_vec();
 
     if (M >= PARALLEL_THRESHOLD) {
         CactusThreading::parallel_for(M, CactusThreading::Thresholds::ELEMENT_WISE,
-            [src, dst, scales, K](size_t m_start, size_t m_end) {
+            [src, dst, scales, K, use_vec](size_t m_start, size_t m_end) {
                 for (size_t m = m_start; m < m_end; m++) {
-                    float max_abs = cactus_fp16_max_abs(src + m * K, K);
-                    float scale = max_abs / 127.0f;
-                    if (scale < 1e-10f) scale = 1e-10f;
-                    scales[m] = scale;
-                    cactus_fp16_to_int8(src + m * K, dst + m * K, K, scale);
+                    if (use_vec) {
+                        float max_abs = cactus_fp16_max_abs(src + m * K, K);
+                        float scale = max_abs / 127.0f;
+                        if (scale < 1e-10f) scale = 1e-10f;
+                        scales[m] = scale;
+                        cactus_fp16_to_int8(src + m * K, dst + m * K, K, scale);
+                    } else {
+                        scales[m] = Fp16Fallback::quantize_row_fp16_to_int8(src + m * K, dst + m * K, K);
+                    }
                 }
             });
     } else {
         for (size_t m = 0; m < M; m++) {
-            float max_abs = cactus_fp16_max_abs(src + m * K, K);
-            float scale = max_abs / 127.0f;
-            if (scale < 1e-10f) scale = 1e-10f;
-            scales[m] = scale;
-            cactus_fp16_to_int8(src + m * K, dst + m * K, K, scale);
+            if (use_vec) {
+                float max_abs = cactus_fp16_max_abs(src + m * K, K);
+                float scale = max_abs / 127.0f;
+                if (scale < 1e-10f) scale = 1e-10f;
+                scales[m] = scale;
+                cactus_fp16_to_int8(src + m * K, dst + m * K, K, scale);
+            } else {
+                scales[m] = Fp16Fallback::quantize_row_fp16_to_int8(src + m * K, dst + m * K, K);
+            }
         }
     }
 }
@@ -220,6 +250,87 @@ void compute_matmul_node(GraphNode& node, const std::vector<std::unique_ptr<Grap
 
     const bool lhs_is_prequantized_int8 = (lhs_buffer.precision == Precision::INT8 &&
                                             lhs_buffer.has_activation_scales());
+
+    if (!has_fp16_vec()) {
+        __fp16* output = node.output_buffer.data_as<__fp16>();
+
+        if (PrecisionTraits::is_integer(rhs_buffer.precision) && rhs_buffer.group_size > 0) {
+            if (!pretransposed_rhs) {
+                throw std::runtime_error("Group-wise quantized matmul requires pretransposed weights");
+            }
+
+            const int8_t* rhs = rhs_buffer.data_as<int8_t>();
+            const __fp16* rhs_scales = rhs_buffer.scales_as_fp16();
+            const size_t group_size = rhs_buffer.group_size;
+            if (group_size == 0 || (K % group_size) != 0) {
+                throw std::runtime_error("Invalid grouped quantized matmul group_size");
+            }
+            const size_t num_groups = K / group_size;
+
+            const int8_t* lhs_int8 = nullptr;
+            const float* lhs_scales = nullptr;
+            if (lhs_is_prequantized_int8) {
+                lhs_int8 = lhs_buffer.data_as<int8_t>();
+                lhs_scales = lhs_buffer.activation_scales_as_float();
+            } else if (lhs_buffer.precision == Precision::FP16) {
+                ensure_quant_buffers(M, K);
+                for (size_t m = 0; m < M; ++m) {
+                    quant_scales_buffer[m] = Fp16Fallback::quantize_row_fp16_to_int8(
+                        lhs_buffer.data_as<__fp16>() + m * K,
+                        quant_activation_buffer.data() + m * K,
+                        K);
+                }
+                lhs_int8 = quant_activation_buffer.data();
+                lhs_scales = quant_scales_buffer.data();
+            } else {
+                throw std::runtime_error("Quantized matmul requires INT8 (pre-quantized) or FP16 activations");
+            }
+
+            for (size_t m = 0; m < M; ++m) {
+                const int8_t* a_row = lhs_int8 + m * K;
+                const float a_scale = lhs_scales[m];
+                for (size_t n = 0; n < N; ++n) {
+                    float sum = 0.0f;
+                    for (size_t k = 0; k < K; ++k) {
+                        const size_t g = k / group_size;
+                        const float w_scale = Fp16Fallback::load_group_scale(rhs_scales, num_groups, n, g);
+                        int8_t w_q = 0;
+                        if (rhs_buffer.precision == Precision::INT8) {
+                            w_q = Fp16Fallback::load_int8_interleaved(rhs, K, n, k);
+                        } else {
+                            w_q = Fp16Fallback::load_int4_interleaved(rhs, K, group_size, n, k);
+                        }
+                        sum += static_cast<float>(a_row[k]) * static_cast<float>(w_q) * w_scale;
+                    }
+                    Fp16Fallback::store_fp16(output + m * N + n, sum * a_scale);
+                }
+            }
+            return;
+        }
+
+        if (lhs_buffer.precision != Precision::FP16 || rhs_buffer.precision != Precision::FP16) {
+            throw std::runtime_error("FP16 matmul requires FP16 activations and FP16 weights");
+        }
+
+        const __fp16* lhs = lhs_buffer.data_as<__fp16>();
+        const __fp16* rhs = rhs_buffer.data_as<__fp16>();
+        const size_t rhs_cols = rhs_shape[rhs_shape.size() - 1];
+
+        for (size_t m = 0; m < M; ++m) {
+            for (size_t n = 0; n < N; ++n) {
+                float sum = 0.0f;
+                for (size_t k = 0; k < K; ++k) {
+                    const float a = Fp16Fallback::load_fp16(lhs + m * K + k);
+                    const float b = pretransposed_rhs
+                        ? Fp16Fallback::load_fp16(rhs + n * K + k)
+                        : Fp16Fallback::load_fp16(rhs + k * rhs_cols + n);
+                    sum += a * b;
+                }
+                Fp16Fallback::store_fp16(output + m * N + n, sum);
+            }
+        }
+        return;
+    }
 
     if (PrecisionTraits::is_integer(rhs_buffer.precision) && rhs_buffer.group_size > 0) {
         const int8_t* rhs = rhs_buffer.data_as<int8_t>();
@@ -309,6 +420,65 @@ namespace {
                                             __fp16* output,
                                             size_t N,
                                             bool lhs_prequantized = false) {
+        if (!has_fp16_vec()) {
+            if (rhs_buffer.precision == Precision::FP16) {
+                const __fp16* rhs = rhs_buffer.data_as<__fp16>();
+                for (size_t m = 0; m < M; ++m) {
+                    for (size_t n = 0; n < N; ++n) {
+                        float sum = 0.0f;
+                        for (size_t k = 0; k < K; ++k) {
+                            const float a = Fp16Fallback::load_fp16(lhs + m * K + k);
+                            const float b = Fp16Fallback::load_fp16(rhs + n * K + k);
+                            sum += a * b;
+                        }
+                        Fp16Fallback::store_fp16(output + m * N + n, sum);
+                    }
+                }
+                return;
+            }
+
+            if (PrecisionTraits::is_integer(rhs_buffer.precision) && rhs_buffer.group_size > 0) {
+                int8_t* lhs_q = moe_lhs_q_buf.data();
+                float* lhs_scales = moe_lhs_scales_buf.data();
+                if (!lhs_prequantized) {
+                    for (size_t row = 0; row < M; ++row) {
+                        lhs_scales[row] = Fp16Fallback::quantize_row_fp16_to_int8(lhs + row * K, lhs_q + row * K, K);
+                    }
+                }
+
+                const int8_t* rhs = rhs_buffer.data_as<int8_t>();
+                const __fp16* rhs_scales = rhs_buffer.scales_as_fp16();
+                const size_t group_size = rhs_buffer.group_size;
+                const size_t num_groups = K / group_size;
+                if (N % 4 != 0) {
+                    throw std::runtime_error("Grouped expert weights require interleaved N dimension divisible by 4");
+                }
+
+                for (size_t m = 0; m < M; ++m) {
+                    const float a_scale = lhs_scales[m];
+                    const int8_t* a_row = lhs_q + m * K;
+                    for (size_t n = 0; n < N; ++n) {
+                        float sum = 0.0f;
+                        for (size_t k = 0; k < K; ++k) {
+                            const size_t group_idx = k / group_size;
+                            const float w_scale = Fp16Fallback::load_group_scale(rhs_scales, num_groups, n, group_idx);
+                            int8_t w_q = 0;
+                            if (rhs_buffer.precision == Precision::INT8) {
+                                w_q = Fp16Fallback::load_int8_interleaved(rhs, K, n, k);
+                            } else {
+                                w_q = Fp16Fallback::load_int4_interleaved(rhs, K, group_size, n, k);
+                            }
+                            sum += static_cast<float>(a_row[k]) * static_cast<float>(w_q) * w_scale;
+                        }
+                        Fp16Fallback::store_fp16(output + m * N + n, sum * a_scale);
+                    }
+                }
+                return;
+            }
+
+            throw std::runtime_error("moe_layer only supports FP16 or grouped INT4/INT8 expert weights");
+        }
+
         if (rhs_buffer.precision == Precision::FP16) {
             cactus_matmul_f16(lhs, rhs_buffer.data_as<__fp16>(), output, M, K, N);
             return;
@@ -386,7 +556,7 @@ void compute_moe_layer_node(GraphNode& node, const std::vector<std::unique_ptr<G
 
     auto routing_prob = [&](size_t tok, size_t exp) -> float {
         const size_t offset = tok * total_num_experts + exp;
-        if (routing_fp16) return static_cast<float>(routing_fp16[offset]);
+        if (routing_fp16) return Fp16Fallback::load_fp16(routing_fp16 + offset);
         return routing_fp32[offset];
     };
 
@@ -438,6 +608,74 @@ void compute_moe_layer_node(GraphNode& node, const std::vector<std::unique_ptr<G
     }
 
     std::memset(output, 0, token_count * hidden_dim * sizeof(__fp16));
+    const bool use_vec = has_fp16_vec();
+
+    auto apply_activation_inplace = [&](Activation act, __fp16* data, size_t count) {
+        if (use_vec) {
+            switch (act) {
+                case Activation::GELU:
+                    cactus_gelu_f16(data, data, count);
+                    return;
+                case Activation::GELU_ERF:
+                    cactus_gelu_f16_erf(data, data, count);
+                    return;
+                case Activation::RELU:
+                    cactus_relu_f16(data, data, count);
+                    return;
+                case Activation::SILU:
+                default:
+                    cactus_silu_f16(data, data, count);
+                    return;
+            }
+        }
+
+        for (size_t i = 0; i < count; ++i) {
+            const float x = Fp16Fallback::load_fp16(data + i);
+            float y = x;
+            switch (act) {
+                case Activation::GELU: {
+                    const float t = std::sqrt(2.0f / 3.14159265358979323846f) * (x + 0.044715f * x * x * x);
+                    y = 0.5f * x * (1.0f + std::tanh(t));
+                    break;
+                }
+                case Activation::GELU_ERF:
+                    y = 0.5f * x * (1.0f + std::erf(x * 0.7071067811865475f));
+                    break;
+                case Activation::RELU:
+                    y = std::max(0.0f, x);
+                    break;
+                case Activation::SILU:
+                default:
+                    y = x / (1.0f + std::exp(-x));
+                    break;
+            }
+            Fp16Fallback::store_fp16(data + i, y);
+        }
+    };
+
+    auto multiply_inplace = [&](const __fp16* a, const __fp16* b, __fp16* out, size_t count) {
+        if (use_vec) {
+            cactus_multiply_f16(a, b, out, count);
+            return;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            const float va = Fp16Fallback::load_fp16(a + i);
+            const float vb = Fp16Fallback::load_fp16(b + i);
+            Fp16Fallback::store_fp16(out + i, va * vb);
+        }
+    };
+
+    auto add_scaled_inplace = [&](const __fp16* base, const __fp16* delta, __fp16* out_ptr, size_t count, float scale) {
+        if (use_vec) {
+            cactus_add_scaled_f16(base, delta, out_ptr, count, scale);
+            return;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            const float b = Fp16Fallback::load_fp16(base + i);
+            const float d = Fp16Fallback::load_fp16(delta + i);
+            Fp16Fallback::store_fp16(out_ptr + i, b + d * scale);
+        }
+    };
 
     for (size_t expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
         const size_t start = expert_offsets[expert_idx];
@@ -465,27 +703,12 @@ void compute_moe_layer_node(GraphNode& node, const std::vector<std::unique_ptr<G
 
         moe_matmul(compact_hidden, selected_count, hidden_dim, w1_buffer, gate, expert_intermediate_dim);
         const bool w1_was_int8 = w1_buffer.is_grouped_int8();
-
-        switch (activation) {
-            case Activation::GELU:
-                cactus_gelu_f16(gate, gate, selected_count * expert_intermediate_dim);
-                break;
-            case Activation::GELU_ERF:
-                cactus_gelu_f16_erf(gate, gate, selected_count * expert_intermediate_dim);
-                break;
-            case Activation::RELU:
-                cactus_relu_f16(gate, gate, selected_count * expert_intermediate_dim);
-                break;
-            case Activation::SILU:
-            default:
-                cactus_silu_f16(gate, gate, selected_count * expert_intermediate_dim);
-                break;
-        }
+        apply_activation_inplace(activation, gate, selected_count * expert_intermediate_dim);
 
         if (gated) {
             const auto& w3_buffer = get_input(node, 3 + num_experts + expert_idx, nodes, node_index_map);
             moe_matmul(compact_hidden, selected_count, hidden_dim, w3_buffer, up, expert_intermediate_dim, w1_was_int8);
-            cactus_multiply_f16(gate, up, gate, selected_count * expert_intermediate_dim);
+            multiply_inplace(gate, up, gate, selected_count * expert_intermediate_dim);
         }
 
         moe_matmul(gate, selected_count, expert_intermediate_dim, w2_buffer, expert_out, hidden_dim);
@@ -501,12 +724,12 @@ void compute_moe_layer_node(GraphNode& node, const std::vector<std::unique_ptr<G
             }
             route_weight *= routed_scaling_factor;
             if (expert_scales_fp16) {
-                route_weight *= static_cast<float>(expert_scales_fp16[expert_idx]);
+                route_weight *= Fp16Fallback::load_fp16(expert_scales_fp16 + expert_idx);
             }
 
             auto* out_row = output + tok * hidden_dim;
             const auto* expert_row = expert_out + i * hidden_dim;
-            cactus_add_scaled_f16(out_row, expert_row, out_row, hidden_dim, route_weight);
+            add_scaled_inplace(out_row, expert_row, out_row, hidden_dim, route_weight);
         }
     }
 }
@@ -527,8 +750,30 @@ void compute_rms_norm_node(GraphNode& node, const std::vector<std::unique_ptr<Gr
         throw std::runtime_error("RMS normalization only supports FP16 precision");
     }
 
-    cactus_rms_norm_f16(input_buffer.data_as<__fp16>(), weight_buffer.data_as<__fp16>(),
-       node.output_buffer.data_as<__fp16>(), batch_size, dims, node.params.epsilon);
+    if (has_fp16_vec()) {
+        cactus_rms_norm_f16(input_buffer.data_as<__fp16>(), weight_buffer.data_as<__fp16>(),
+            node.output_buffer.data_as<__fp16>(), batch_size, dims, node.params.epsilon);
+        return;
+    }
+
+    const __fp16* in = input_buffer.data_as<__fp16>();
+    const __fp16* w = weight_buffer.data_as<__fp16>();
+    __fp16* out = node.output_buffer.data_as<__fp16>();
+
+    for (size_t b = 0; b < batch_size; ++b) {
+        float sq_sum = 0.0f;
+        const size_t row_off = b * dims;
+        for (size_t i = 0; i < dims; ++i) {
+            const float v = Fp16Fallback::load_fp16(in + row_off + i);
+            sq_sum += v * v;
+        }
+        const float inv_rms = 1.0f / std::sqrt((sq_sum / static_cast<float>(dims)) + node.params.epsilon);
+        for (size_t i = 0; i < dims; ++i) {
+            const float v = Fp16Fallback::load_fp16(in + row_off + i);
+            const float ww = Fp16Fallback::load_fp16(w + i);
+            Fp16Fallback::store_fp16(out + row_off + i, v * inv_rms * ww);
+        }
+    }
 }
 
 void compute_rope_node(GraphNode& node, const std::vector<std::unique_ptr<GraphNode>>& nodes, const std::unordered_map<size_t, size_t>& node_index_map) {
@@ -553,8 +798,35 @@ void compute_rope_node(GraphNode& node, const std::vector<std::unique_ptr<GraphN
     size_t num_heads = shape[2];
     size_t head_dim = shape[3];
 
-    cactus_rope_f16(input_buffer.data_as<__fp16>(), node.output_buffer.data_as<__fp16>(),
-                   batch_size, seq_len, num_heads, head_dim, node.params.position_offset, node.params.theta);
+    if (has_fp16_vec()) {
+        cactus_rope_f16(input_buffer.data_as<__fp16>(), node.output_buffer.data_as<__fp16>(),
+            batch_size, seq_len, num_heads, head_dim, node.params.position_offset, node.params.theta);
+        return;
+    }
+
+    const __fp16* input = input_buffer.data_as<__fp16>();
+    __fp16* output = node.output_buffer.data_as<__fp16>();
+    const size_t half_dim = head_dim / 2;
+
+    for (size_t b = 0; b < batch_size; ++b) {
+        for (size_t t = 0; t < seq_len; ++t) {
+            const size_t pos = node.params.position_offset + t;
+            for (size_t h = 0; h < num_heads; ++h) {
+                const size_t base = ((b * seq_len + t) * num_heads + h) * head_dim;
+                for (size_t i = 0; i < half_dim; ++i) {
+                    const float exponent = (2.0f * static_cast<float>(i)) / static_cast<float>(head_dim);
+                    const float inv_freq = std::pow(node.params.theta, -exponent);
+                    const float angle = static_cast<float>(pos) * inv_freq;
+                    const float c = std::cos(angle);
+                    const float s = std::sin(angle);
+                    const float x0 = Fp16Fallback::load_fp16(input + base + i);
+                    const float x1 = Fp16Fallback::load_fp16(input + base + i + half_dim);
+                    Fp16Fallback::store_fp16(output + base + i, x0 * c - x1 * s);
+                    Fp16Fallback::store_fp16(output + base + i + half_dim, x1 * c + x0 * s);
+                }
+            }
+        }
+    }
 }
 
 void compute_softmax_node(GraphNode& node, const std::vector<std::unique_ptr<GraphNode>>& nodes, const std::unordered_map<size_t, size_t>& node_index_map) {
@@ -576,8 +848,30 @@ void compute_softmax_node(GraphNode& node, const std::vector<std::unique_ptr<Gra
     }
     size_t vocab_size = shape[shape.size() - 1];
 
-    cactus_softmax_f16(input_buffer.data_as<__fp16>(), node.output_buffer.data_as<__fp16>(),
-                      batch_size, 1, vocab_size);
+    if (has_fp16_vec()) {
+        cactus_softmax_f16(input_buffer.data_as<__fp16>(), node.output_buffer.data_as<__fp16>(),
+            batch_size, 1, vocab_size);
+        return;
+    }
+
+    const __fp16* in = input_buffer.data_as<__fp16>();
+    __fp16* out = node.output_buffer.data_as<__fp16>();
+    for (size_t b = 0; b < batch_size; ++b) {
+        const size_t off = b * vocab_size;
+        float max_v = -std::numeric_limits<float>::infinity();
+        for (size_t i = 0; i < vocab_size; ++i) {
+            max_v = std::max(max_v, Fp16Fallback::load_fp16(in + off + i));
+        }
+        float sum = 0.0f;
+        for (size_t i = 0; i < vocab_size; ++i) {
+            sum += std::exp(Fp16Fallback::load_fp16(in + off + i) - max_v);
+        }
+        const float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+        for (size_t i = 0; i < vocab_size; ++i) {
+            const float p = std::exp(Fp16Fallback::load_fp16(in + off + i) - max_v) * inv_sum;
+            Fp16Fallback::store_fp16(out + off + i, p);
+        }
+    }
 }
 
 void compute_rel_pos_bias_node(GraphNode& node, const std::vector<std::unique_ptr<GraphNode>>& nodes,
@@ -650,9 +944,9 @@ void compute_rel_pos_bias_node(GraphNode& node, const std::vector<std::unique_pt
 
                     float acc = 0.0f;
                     for (size_t d = 0; d < D; ++d) {
-                        acc += static_cast<float>(q_vec[d]) * static_cast<float>(r_vec[d]);
+                        acc += Fp16Fallback::load_fp16(q_vec + d) * Fp16Fallback::load_fp16(r_vec + d);
                     }
-                    y_row[j] = static_cast<__fp16>(acc * scale);
+                    Fp16Fallback::store_fp16(y_row + j, acc * scale);
                 }
             }
         });
@@ -724,11 +1018,103 @@ void compute_attention_node(GraphNode& node, const std::vector<std::unique_ptr<G
         mask_ptr = mask_buffer->data_as<__fp16>();
     }
 
-    cactus_attention_f16(query_buffer.data_as<__fp16>(), key_buffer.data_as<__fp16>(),
-                         value_buffer.data_as<__fp16>(), node.output_buffer.data_as<__fp16>(),
-                         batch_size, seq_len, kv_seq_len, num_q_heads, num_kv_heads, head_dim, node.params.scale, mask_ptr,
-                         node.params.position_offset, node.params.window_size, node.params.is_causal,
-                         node.params.attention_mask_is_additive, mask_per_head, v_head_dim, node.params.logit_cap);
+    if (has_fp16_vec()) {
+        cactus_attention_f16(query_buffer.data_as<__fp16>(), key_buffer.data_as<__fp16>(),
+            value_buffer.data_as<__fp16>(), node.output_buffer.data_as<__fp16>(),
+            batch_size, seq_len, kv_seq_len, num_q_heads, num_kv_heads, head_dim, node.params.scale, mask_ptr,
+            node.params.position_offset, node.params.window_size, node.params.is_causal,
+            node.params.attention_mask_is_additive, mask_per_head, v_head_dim, node.params.logit_cap);
+        return;
+    }
+
+    const __fp16* q = query_buffer.data_as<__fp16>();
+    const __fp16* k = key_buffer.data_as<__fp16>();
+    const __fp16* v = value_buffer.data_as<__fp16>();
+    __fp16* o = node.output_buffer.data_as<__fp16>();
+
+    const size_t gqa_group_size = std::max<size_t>(1, num_q_heads / std::max<size_t>(1, num_kv_heads));
+    const size_t q_batch_stride = seq_len * num_q_heads * head_dim;
+    const size_t kv_batch_stride = kv_seq_len * num_kv_heads * head_dim;
+    const size_t v_batch_stride = kv_seq_len * num_kv_heads * v_head_dim;
+    const size_t o_batch_stride = seq_len * num_q_heads * v_head_dim;
+
+    std::vector<float> scores(kv_seq_len);
+
+    for (size_t b = 0; b < batch_size; ++b) {
+        for (size_t qh = 0; qh < num_q_heads; ++qh) {
+            const size_t kv_head = std::min(num_kv_heads - 1, qh / gqa_group_size);
+            for (size_t t = 0; t < seq_len; ++t) {
+                const size_t abs_q = node.params.position_offset + t;
+                const __fp16* q_vec = q + b * q_batch_stride + (t * num_q_heads + qh) * head_dim;
+                __fp16* o_vec = o + b * o_batch_stride + (t * num_q_heads + qh) * v_head_dim;
+
+                size_t kv_start = 0;
+                size_t kv_end = kv_seq_len;
+                if (node.params.window_size > 0 && abs_q > node.params.window_size) {
+                    kv_start = abs_q - node.params.window_size;
+                }
+                if (node.params.is_causal) {
+                    kv_end = std::min(kv_end, abs_q + 1);
+                }
+
+                float max_score = -std::numeric_limits<float>::infinity();
+                for (size_t s = 0; s < kv_seq_len; ++s) scores[s] = -std::numeric_limits<float>::infinity();
+
+                for (size_t s = kv_start; s < kv_end; ++s) {
+                    const __fp16* k_vec = k + b * kv_batch_stride + (s * num_kv_heads + kv_head) * head_dim;
+                    float score = 0.0f;
+                    for (size_t d = 0; d < head_dim; ++d) {
+                        score += Fp16Fallback::load_fp16(q_vec + d) * Fp16Fallback::load_fp16(k_vec + d);
+                    }
+                    score *= node.params.scale;
+
+                    if (mask_ptr) {
+                        const size_t mask_index = mask_per_head
+                            ? (((b * num_q_heads + qh) * seq_len + t) * kv_seq_len + s)
+                            : (((b * seq_len) + t) * kv_seq_len + s);
+                        const float mask_value = Fp16Fallback::load_fp16(mask_ptr + mask_index);
+                        if (node.params.attention_mask_is_additive) {
+                            if (!std::isfinite(mask_value)) {
+                                score = -std::numeric_limits<float>::infinity();
+                            } else {
+                                score += mask_value;
+                            }
+                        } else if (mask_value == 0.0f) {
+                            score = -std::numeric_limits<float>::infinity();
+                        }
+                    }
+
+                    if (node.params.logit_cap > 0.0f && std::isfinite(score)) {
+                        score = node.params.logit_cap * std::tanh(score / node.params.logit_cap);
+                    }
+
+                    scores[s] = score;
+                    max_score = std::max(max_score, score);
+                }
+
+                float sum = 0.0f;
+                for (size_t s = kv_start; s < kv_end; ++s) {
+                    if (std::isfinite(scores[s])) {
+                        scores[s] = std::exp(scores[s] - max_score);
+                        sum += scores[s];
+                    } else {
+                        scores[s] = 0.0f;
+                    }
+                }
+                const float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+
+                for (size_t d = 0; d < v_head_dim; ++d) {
+                    float acc = 0.0f;
+                    for (size_t s = kv_start; s < kv_end; ++s) {
+                        if (scores[s] == 0.0f) continue;
+                        const __fp16* v_vec = v + b * v_batch_stride + (s * num_kv_heads + kv_head) * v_head_dim;
+                        acc += (scores[s] * inv_sum) * Fp16Fallback::load_fp16(v_vec + d);
+                    }
+                    Fp16Fallback::store_fp16(o_vec + d, acc);
+                }
+            }
+        }
+    }
 }
 
 void compute_attention_int8_hybrid_node(GraphNode& node, const std::vector<std::unique_ptr<GraphNode>>& nodes, const std::unordered_map<size_t, size_t>& node_index_map) {
@@ -750,20 +1136,117 @@ void compute_attention_int8_hybrid_node(GraphNode& node, const std::vector<std::
     size_t cache_len = node.params.cache_seq_len;
     size_t new_len = key_new_buffer.shape[1];
 
-    cactus_attention_hybrid_int8_fp16(
-        query_buffer.data_as<__fp16>(),
-        node.params.cached_keys_int8,
-        node.params.cached_values_int8,
-        node.params.cached_k_scales,
-        node.params.cached_v_scales,
-        key_new_buffer.data_as<__fp16>(),
-        value_new_buffer.data_as<__fp16>(),
-        node.output_buffer.data_as<__fp16>(),
-        batch_size, seq_len, cache_len, new_len,
-        num_q_heads, num_kv_heads, head_dim,
-        node.params.scale, node.params.position_offset, true,
-        node.params.window_size, KV_QUANT_GROUP_SIZE, v_head_dim
-    );
+    if (has_fp16_vec()) {
+        cactus_attention_hybrid_int8_fp16(
+            query_buffer.data_as<__fp16>(),
+            node.params.cached_keys_int8,
+            node.params.cached_values_int8,
+            node.params.cached_k_scales,
+            node.params.cached_v_scales,
+            key_new_buffer.data_as<__fp16>(),
+            value_new_buffer.data_as<__fp16>(),
+            node.output_buffer.data_as<__fp16>(),
+            batch_size, seq_len, cache_len, new_len,
+            num_q_heads, num_kv_heads, head_dim,
+            node.params.scale, node.params.position_offset, true,
+            node.params.window_size, KV_QUANT_GROUP_SIZE, v_head_dim
+        );
+        return;
+    }
+
+    const __fp16* q = query_buffer.data_as<__fp16>();
+    const __fp16* k_new = key_new_buffer.data_as<__fp16>();
+    const __fp16* v_new = value_new_buffer.data_as<__fp16>();
+    const int8_t* k_cache = node.params.cached_keys_int8;
+    const int8_t* v_cache = node.params.cached_values_int8;
+    const float* k_scales = node.params.cached_k_scales;
+    const float* v_scales = node.params.cached_v_scales;
+    __fp16* out = node.output_buffer.data_as<__fp16>();
+
+    const size_t total_kv_len = cache_len + new_len;
+    const size_t gqa_group_size = std::max<size_t>(1, num_q_heads / std::max<size_t>(1, num_kv_heads));
+    const size_t num_groups_k = (head_dim + KV_QUANT_GROUP_SIZE - 1) / KV_QUANT_GROUP_SIZE;
+    const size_t num_groups_v = (v_head_dim + KV_QUANT_GROUP_SIZE - 1) / KV_QUANT_GROUP_SIZE;
+
+    const size_t q_batch_stride = seq_len * num_q_heads * head_dim;
+    const size_t k_new_batch_stride = new_len * num_kv_heads * head_dim;
+    const size_t v_new_batch_stride = new_len * num_kv_heads * v_head_dim;
+    const size_t k_cache_batch_stride = cache_len * num_kv_heads * head_dim;
+    const size_t v_cache_batch_stride = cache_len * num_kv_heads * v_head_dim;
+    const size_t out_batch_stride = seq_len * num_q_heads * v_head_dim;
+
+    std::vector<float> scores(total_kv_len, 0.0f);
+
+    for (size_t b = 0; b < batch_size; ++b) {
+        for (size_t qh = 0; qh < num_q_heads; ++qh) {
+            const size_t kv_head = std::min(num_kv_heads - 1, qh / gqa_group_size);
+            for (size_t t = 0; t < seq_len; ++t) {
+                const size_t abs_q = node.params.position_offset + t;
+                const __fp16* q_vec = q + b * q_batch_stride + (t * num_q_heads + qh) * head_dim;
+                __fp16* o_vec = out + b * out_batch_stride + (t * num_q_heads + qh) * v_head_dim;
+
+                size_t kv_start = 0;
+                if (node.params.window_size > 0 && abs_q > node.params.window_size) {
+                    kv_start = abs_q - node.params.window_size;
+                }
+                size_t kv_end = std::min(total_kv_len, abs_q + 1);
+
+                float max_score = -std::numeric_limits<float>::infinity();
+                for (size_t s = 0; s < total_kv_len; ++s) scores[s] = -std::numeric_limits<float>::infinity();
+
+                for (size_t s = kv_start; s < kv_end; ++s) {
+                    float score = 0.0f;
+                    if (s < cache_len) {
+                        const int8_t* k_ptr = k_cache + b * k_cache_batch_stride + (s * num_kv_heads + kv_head) * head_dim;
+                        const float* ks = k_scales + (b * cache_len + s) * num_kv_heads * num_groups_k + kv_head * num_groups_k;
+                        for (size_t d = 0; d < head_dim; ++d) {
+                            score += Fp16Fallback::load_fp16(q_vec + d) *
+                                     (static_cast<float>(k_ptr[d]) * ks[d / KV_QUANT_GROUP_SIZE]);
+                        }
+                    } else {
+                        const size_t new_pos = s - cache_len;
+                        const __fp16* k_ptr = k_new + b * k_new_batch_stride + (new_pos * num_kv_heads + kv_head) * head_dim;
+                        for (size_t d = 0; d < head_dim; ++d) {
+                            score += Fp16Fallback::load_fp16(q_vec + d) * Fp16Fallback::load_fp16(k_ptr + d);
+                        }
+                    }
+                    score *= node.params.scale;
+                    scores[s] = score;
+                    max_score = std::max(max_score, score);
+                }
+
+                float sum = 0.0f;
+                for (size_t s = kv_start; s < kv_end; ++s) {
+                    if (std::isfinite(scores[s])) {
+                        scores[s] = std::exp(scores[s] - max_score);
+                        sum += scores[s];
+                    } else {
+                        scores[s] = 0.0f;
+                    }
+                }
+                const float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+
+                for (size_t d = 0; d < v_head_dim; ++d) {
+                    float acc = 0.0f;
+                    for (size_t s = kv_start; s < kv_end; ++s) {
+                        if (scores[s] == 0.0f) continue;
+                        float vv = 0.0f;
+                        if (s < cache_len) {
+                            const int8_t* v_ptr = v_cache + b * v_cache_batch_stride + (s * num_kv_heads + kv_head) * v_head_dim;
+                            const float* vs = v_scales + (b * cache_len + s) * num_kv_heads * num_groups_v + kv_head * num_groups_v;
+                            vv = static_cast<float>(v_ptr[d]) * vs[d / KV_QUANT_GROUP_SIZE];
+                        } else {
+                            const size_t new_pos = s - cache_len;
+                            const __fp16* v_ptr = v_new + b * v_new_batch_stride + (new_pos * num_kv_heads + kv_head) * v_head_dim;
+                            vv = Fp16Fallback::load_fp16(v_ptr + d);
+                        }
+                        acc += (scores[s] * inv_sum) * vv;
+                    }
+                    Fp16Fallback::store_fp16(o_vec + d, acc);
+                }
+            }
+        }
+    }
 }
 
 void compute_layernorm_node(GraphNode& node, const std::vector<std::unique_ptr<GraphNode>>& nodes, const std::unordered_map<size_t, size_t>& node_index_map) {
@@ -793,7 +1276,8 @@ void compute_layernorm_node(GraphNode& node, const std::vector<std::unique_ptr<G
         bias_buffer_ptr = &bias_buffer;
     }
 
-    if (input_buffer.precision == Precision::FP16 &&
+    if (has_fp16_vec() &&
+        input_buffer.precision == Precision::FP16 &&
         weight_buffer.precision == Precision::FP16 &&
         node.output_buffer.precision == Precision::FP16 &&
         (!has_bias || bias_buffer_ptr->precision == Precision::FP16)) {
@@ -817,7 +1301,7 @@ void compute_layernorm_node(GraphNode& node, const std::vector<std::unique_ptr<G
     } else if (input_buffer.precision == Precision::FP16) {
         const __fp16* input_fp16 = input_buffer.data_as<__fp16>();
         for (size_t i = 0; i < input_buffer.total_size; ++i) {
-            input_float[i] = static_cast<float>(input_fp16[i]);
+            input_float[i] = Fp16Fallback::load_fp16(input_fp16 + i);
         }
     } else {
         std::memcpy(input_float.data(), input_buffer.data_as<float>(), input_buffer.total_size * sizeof(float));
@@ -828,7 +1312,7 @@ void compute_layernorm_node(GraphNode& node, const std::vector<std::unique_ptr<G
     } else if (weight_buffer.precision == Precision::FP16) {
         const __fp16* weight_fp16 = weight_buffer.data_as<__fp16>();
         for (size_t i = 0; i < feature_size; ++i) {
-            weight_float[i] = static_cast<float>(weight_fp16[i]);
+            weight_float[i] = Fp16Fallback::load_fp16(weight_fp16 + i);
         }
     } else {
         std::memcpy(weight_float.data(), weight_buffer.data_as<float>(), feature_size * sizeof(float));
@@ -841,7 +1325,7 @@ void compute_layernorm_node(GraphNode& node, const std::vector<std::unique_ptr<G
         } else if (bias_buffer.precision == Precision::FP16) {
             const __fp16* bias_fp16 = bias_buffer.data_as<__fp16>();
             for (size_t i = 0; i < feature_size; ++i) {
-                bias_float[i] = static_cast<float>(bias_fp16[i]);
+                bias_float[i] = Fp16Fallback::load_fp16(bias_fp16 + i);
             }
         } else {
             std::memcpy(bias_float.data(), bias_buffer.data_as<float>(), feature_size * sizeof(float));
@@ -877,7 +1361,7 @@ void compute_layernorm_node(GraphNode& node, const std::vector<std::unique_ptr<G
     } else if (node.output_buffer.precision == Precision::FP16) {
         __fp16* output_fp16 = node.output_buffer.data_as<__fp16>();
         for (size_t i = 0; i < input_buffer.total_size; ++i) {
-            output_fp16[i] = static_cast<__fp16>(output_float[i]);
+            Fp16Fallback::store_fp16(output_fp16 + i, output_float[i]);
         }
     } else {
         std::memcpy(node.output_buffer.data_as<float>(), output_float.data(), input_buffer.total_size * sizeof(float));
@@ -932,6 +1416,90 @@ void compute_conv1d_causal_node(GraphNode& node, const std::vector<std::unique_p
         }
         return transposed;
     };
+
+    if (!has_fp16_vec()) {
+        if (X.precision != Precision::FP16) {
+            throw std::runtime_error("Depthwise causal conv fallback requires FP16 activations");
+        }
+        if (W.precision != Precision::FP16 && W.precision != Precision::INT8) {
+            throw std::runtime_error("Depthwise causal conv fallback supports INT8/FP16 weights");
+        }
+
+        std::vector<float> w_float(W0 * K, 0.0f);
+        if (W.precision == Precision::FP16) {
+            const __fp16* w_src = W.data_as<__fp16>();
+            if (transposed_layout && !standard_layout) {
+                for (size_t oc = 0; oc < W0; ++oc) {
+                    for (size_t kk = 0; kk < K; ++kk) {
+                        w_float[oc * K + kk] = Fp16Fallback::load_fp16(w_src + (oc * W1 + kk) * W2);
+                    }
+                }
+            } else {
+                for (size_t i = 0; i < W0 * K; ++i) {
+                    w_float[i] = Fp16Fallback::load_fp16(w_src + i);
+                }
+            }
+        } else {
+            const int8_t* w_q = W.data_as<int8_t>();
+            if (W.is_grouped_int8()) {
+                const __fp16* scales = W.scales_as_fp16();
+                const size_t K_total = W1 * K;
+                const size_t group_size = W.group_size;
+                const size_t num_groups = K_total / group_size;
+                if (transposed_layout && !standard_layout) {
+                    for (size_t oc = 0; oc < W0; ++oc) {
+                        for (size_t kk = 0; kk < K; ++kk) {
+                            const size_t col = kk;
+                            const size_t g = col / group_size;
+                            const float s = Fp16Fallback::load_fp16(scales + oc * num_groups + g);
+                            w_float[oc * K + kk] = static_cast<float>(w_q[(oc * W1 + kk) * W2]) * s;
+                        }
+                    }
+                } else {
+                    for (size_t oc = 0; oc < W0; ++oc) {
+                        for (size_t kk = 0; kk < K; ++kk) {
+                            const size_t g = kk / group_size;
+                            const float s = Fp16Fallback::load_fp16(scales + oc * num_groups + g);
+                            w_float[oc * K + kk] = static_cast<float>(w_q[oc * K + kk]) * s;
+                        }
+                    }
+                }
+            } else {
+                if (transposed_layout && !standard_layout) {
+                    for (size_t oc = 0; oc < W0; ++oc) {
+                        for (size_t kk = 0; kk < K; ++kk) {
+                            w_float[oc * K + kk] = static_cast<float>(w_q[(oc * W1 + kk) * W2]);
+                        }
+                    }
+                } else {
+                    for (size_t i = 0; i < W0 * K; ++i) {
+                        w_float[i] = static_cast<float>(w_q[i]);
+                    }
+                }
+            }
+        }
+
+        const __fp16* x_src = X.data_as<__fp16>();
+        __fp16* y_dst = Y.data_as<__fp16>();
+        for (size_t n = 0; n < N; ++n) {
+            for (size_t t = 0; t < L; ++t) {
+                for (size_t oc = 0; oc < C_out; ++oc) {
+                    const size_t ic = oc / M;
+                    const float* w_row = w_float.data() + oc * K;
+                    float acc = 0.0f;
+                    for (size_t kk = 0; kk < K; ++kk) {
+                        const size_t shift = kk * dil;
+                        if (shift > t) continue;
+                        const size_t src_t = t - shift;
+                        const size_t x_idx = (n * L + src_t) * C_in + ic;
+                        acc += Fp16Fallback::load_fp16(x_src + x_idx) * w_row[kk];
+                    }
+                    Fp16Fallback::store_fp16(y_dst + (n * L + t) * C_out + oc, acc);
+                }
+            }
+        }
+        return;
+    }
 
     if (W.precision == Precision::INT8) {
         const size_t W_size = W0 * W1 * W2;
@@ -1936,9 +2504,79 @@ void compute_gated_deltanet_decode_node(GraphNode& node, const std::vector<std::
     const __fp16* s_data = as_fp16_ptr(s, s_cast);
     __fp16* out = node.output_buffer.data_as<__fp16>();
 
-    cactus_gated_deltanet_decode_f16(
-        q_data, k_data, v_data, g_data, b_data, s_data, out,
-        B, Hq, Hv, K, V, node.params.scale);
+    if (has_fp16_vec()) {
+        cactus_gated_deltanet_decode_f16(
+            q_data, k_data, v_data, g_data, b_data, s_data, out,
+            B, Hq, Hv, K, V, node.params.scale);
+        return;
+    }
+
+    auto load = [](const BufferDesc& buf, size_t idx) -> float {
+        if (buf.precision == Precision::FP32) return buf.data_as<float>()[idx];
+        return Fp16Fallback::load_fp16(buf.data_as<__fp16>() + idx);
+    };
+
+    const size_t qk_repeat = Hv / Hq;
+    const size_t out_seq = 1 + K;
+    std::vector<float> state(K * V, 0.0f);
+    std::vector<float> proj(V, 0.0f);
+    std::vector<float> delta(V, 0.0f);
+    const float scale = node.params.scale;
+
+    for (size_t batch = 0; batch < B; ++batch) {
+        for (size_t v_head = 0; v_head < Hv; ++v_head) {
+            const size_t qk_head = v_head / qk_repeat;
+
+            for (size_t kd = 0; kd < K; ++kd) {
+                for (size_t vd = 0; vd < V; ++vd) {
+                    const size_t s_idx = (((batch * K + kd) * Hv + v_head) * V + vd);
+                    state[kd * V + vd] = load(s, s_idx);
+                }
+            }
+
+            const float gate_log = load(g, batch * Hv + v_head);
+            const float beta = std::min(1.0f, std::max(0.0f, load(b, batch * Hv + v_head)));
+            const float gate = std::exp(std::max(-20.0f, std::min(6.0f, gate_log)));
+
+            for (size_t vd = 0; vd < V; ++vd) {
+                proj[vd] = 0.0f;
+                for (size_t kd = 0; kd < K; ++kd) {
+                    const size_t k_idx = ((batch * Hq + qk_head) * K + kd);
+                    proj[vd] += state[kd * V + vd] * load(k, k_idx);
+                }
+            }
+
+            for (size_t vd = 0; vd < V; ++vd) {
+                const size_t v_idx = ((batch * Hv + v_head) * V + vd);
+                delta[vd] = (load(v, v_idx) - proj[vd]) * beta;
+            }
+
+            for (size_t kd = 0; kd < K; ++kd) {
+                const size_t k_idx = ((batch * Hq + qk_head) * K + kd);
+                const float kval = load(k, k_idx);
+                for (size_t vd = 0; vd < V; ++vd) {
+                    state[kd * V + vd] = gate * state[kd * V + vd] + kval * delta[vd];
+                }
+            }
+
+            for (size_t vd = 0; vd < V; ++vd) {
+                float acc = 0.0f;
+                for (size_t kd = 0; kd < K; ++kd) {
+                    const size_t q_idx = ((batch * Hq + qk_head) * K + kd);
+                    acc += state[kd * V + vd] * load(q, q_idx);
+                }
+                const size_t out_idx = (((batch * out_seq) * Hv + v_head) * V + vd);
+                Fp16Fallback::store_fp16(out + out_idx, acc * scale);
+            }
+
+            for (size_t kd = 0; kd < K; ++kd) {
+                for (size_t vd = 0; vd < V; ++vd) {
+                    const size_t out_idx = (((batch * out_seq + (1 + kd)) * Hv + v_head) * V + vd);
+                    Fp16Fallback::store_fp16(out + out_idx, state[kd * V + vd]);
+                }
+            }
+        }
+    }
 }
 
 void compute_gated_deltanet_prefill_node(GraphNode& node, const std::vector<std::unique_ptr<GraphNode>>& nodes,
@@ -1981,9 +2619,81 @@ void compute_gated_deltanet_prefill_node(GraphNode& node, const std::vector<std:
     const __fp16* s_data = as_fp16_ptr(s, s_cast);
     __fp16* out = node.output_buffer.data_as<__fp16>();
 
-    cactus_gated_deltanet_prefill_f16(
-        q_data, k_data, v_data, g_data, b_data, s_data, out,
-        B, T, Hq, Hv, K, V, node.params.chunk_size, node.params.scale);
+    if (has_fp16_vec()) {
+        cactus_gated_deltanet_prefill_f16(
+            q_data, k_data, v_data, g_data, b_data, s_data, out,
+            B, T, Hq, Hv, K, V, node.params.chunk_size, node.params.scale);
+        return;
+    }
+
+    auto load = [](const BufferDesc& buf, size_t idx) -> float {
+        if (buf.precision == Precision::FP32) return buf.data_as<float>()[idx];
+        return Fp16Fallback::load_fp16(buf.data_as<__fp16>() + idx);
+    };
+
+    const size_t qk_repeat = Hv / Hq;
+    const size_t out_seq = T + K;
+    std::vector<float> state(K * V, 0.0f);
+    std::vector<float> proj(V, 0.0f);
+    std::vector<float> delta(V, 0.0f);
+    const float scale = node.params.scale;
+
+    for (size_t batch = 0; batch < B; ++batch) {
+        for (size_t v_head = 0; v_head < Hv; ++v_head) {
+            const size_t qk_head = v_head / qk_repeat;
+
+            for (size_t kd = 0; kd < K; ++kd) {
+                for (size_t vd = 0; vd < V; ++vd) {
+                    const size_t s_idx = (((batch * K + kd) * Hv + v_head) * V + vd);
+                    state[kd * V + vd] = load(s, s_idx);
+                }
+            }
+
+            for (size_t t = 0; t < T; ++t) {
+                const float gate_log = load(g, (batch * T + t) * Hv + v_head);
+                const float beta = std::min(1.0f, std::max(0.0f, load(b, (batch * T + t) * Hv + v_head)));
+                const float gate = std::exp(std::max(-20.0f, std::min(6.0f, gate_log)));
+
+                for (size_t vd = 0; vd < V; ++vd) {
+                    proj[vd] = 0.0f;
+                    for (size_t kd = 0; kd < K; ++kd) {
+                        const size_t k_idx = (((batch * T + t) * Hq + qk_head) * K + kd);
+                        proj[vd] += state[kd * V + vd] * load(k, k_idx);
+                    }
+                }
+
+                for (size_t vd = 0; vd < V; ++vd) {
+                    const size_t v_idx = (((batch * T + t) * Hv + v_head) * V + vd);
+                    delta[vd] = (load(v, v_idx) - proj[vd]) * beta;
+                }
+
+                for (size_t kd = 0; kd < K; ++kd) {
+                    const size_t k_idx = (((batch * T + t) * Hq + qk_head) * K + kd);
+                    const float kval = load(k, k_idx);
+                    for (size_t vd = 0; vd < V; ++vd) {
+                        state[kd * V + vd] = gate * state[kd * V + vd] + kval * delta[vd];
+                    }
+                }
+
+                for (size_t vd = 0; vd < V; ++vd) {
+                    float acc = 0.0f;
+                    for (size_t kd = 0; kd < K; ++kd) {
+                        const size_t q_idx = (((batch * T + t) * Hq + qk_head) * K + kd);
+                        acc += state[kd * V + vd] * load(q, q_idx);
+                    }
+                    const size_t out_idx = (((batch * out_seq + t) * Hv + v_head) * V + vd);
+                    Fp16Fallback::store_fp16(out + out_idx, acc * scale);
+                }
+            }
+
+            for (size_t kd = 0; kd < K; ++kd) {
+                for (size_t vd = 0; vd < V; ++vd) {
+                    const size_t out_idx = (((batch * out_seq + (T + kd)) * Hv + v_head) * V + vd);
+                    Fp16Fallback::store_fp16(out + out_idx, state[kd * V + vd]);
+                }
+            }
+        }
+    }
 }
 
 void compute_rope_gptj_node(GraphNode& node, const std::vector<std::unique_ptr<GraphNode>>& nodes,
@@ -2352,4 +3062,3 @@ void compute_weighted_stats_pool_node(GraphNode& node, const std::vector<std::un
         }
     }
 }
-

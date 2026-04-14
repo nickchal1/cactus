@@ -1,4 +1,5 @@
 #include "graph.h"
+#include "fp16_fallback.h"
 #include "../kernel/kernel.h"
 #include "../kernel/kernel_utils.h"
 #include <cstring>
@@ -20,7 +21,36 @@ void compute_transpose_node(GraphNode& node, const std::vector<std::unique_ptr<G
 
     const __fp16* input = input_buffer.data_as<__fp16>();
     __fp16* output = node.output_buffer.data_as<__fp16>();
-    cactus_transpose_f16(input, output, input_buffer.shape.data(), permutation.data(), permutation.size(), 0, input_buffer.total_size);
+    if (cpu_has_fp16_vector_arithmetic()) {
+        cactus_transpose_f16(input, output, input_buffer.shape.data(), permutation.data(), permutation.size(), 0, input_buffer.total_size);
+        return;
+    }
+
+    const size_t rank = permutation.size();
+    if (rank != input_buffer.shape.size()) {
+        throw std::runtime_error("Transpose permutation rank does not match input rank");
+    }
+
+    std::vector<size_t> in_strides(rank, 1);
+    for (size_t i = rank; i-- > 1;) {
+        in_strides[i - 1] = in_strides[i] * input_buffer.shape[i];
+    }
+
+    std::vector<size_t> out_strides(rank, 1);
+    for (size_t i = rank; i-- > 1;) {
+        out_strides[i - 1] = out_strides[i] * node.output_buffer.shape[i];
+    }
+
+    for (size_t out_idx = 0; out_idx < node.output_buffer.total_size; ++out_idx) {
+        size_t rem = out_idx;
+        size_t in_idx = 0;
+        for (size_t od = 0; od < rank; ++od) {
+            const size_t coord = rem / out_strides[od];
+            rem %= out_strides[od];
+            in_idx += coord * in_strides[permutation[od]];
+        }
+        std::memcpy(output + out_idx, input + in_idx, sizeof(__fp16));
+    }
 }
 
 void compute_gather_node(GraphNode& node, const std::vector<std::unique_ptr<GraphNode>>& nodes, const std::unordered_map<size_t, size_t>& node_index_map) {
@@ -223,6 +253,56 @@ void compute_embedding_node(GraphNode& node, const std::vector<std::unique_ptr<G
     }
 
     __fp16* output = node.output_buffer.data_as<__fp16>();
+    if (!cpu_has_fp16_vector_arithmetic()) {
+        if (PrecisionTraits::is_integer(embeddings_buffer.precision) && embeddings_buffer.group_size > 0) {
+            const int8_t* embeddings = embeddings_buffer.data_as<int8_t>();
+            const __fp16* scales = embeddings_buffer.scales_as_fp16();
+            const size_t group_size = embeddings_buffer.group_size;
+            const size_t num_groups = embeddings_buffer.num_groups;
+            const Precision emb_prec = embeddings_buffer.precision;
+
+            for (size_t i = 0; i < num_indices; ++i) {
+                const size_t idx = static_cast<size_t>(indices_ptr[i]);
+                if (idx >= vocab_size) {
+                    throw std::runtime_error("Embedding index out of bounds: " + std::to_string(idx) + " >= " + std::to_string(vocab_size));
+                }
+
+                const size_t block = idx / 4;
+                const size_t lane = idx % 4;
+                __fp16* out_row = output + i * hidden_dim;
+
+                for (size_t g = 0; g < num_groups; ++g) {
+                    const float scale = Fp16Fallback::load_fp16(scales + (block * num_groups + g) * 4 + lane);
+                    const size_t k_start = g * group_size;
+                    const size_t k_end = std::min(k_start + group_size, hidden_dim);
+                    for (size_t k = k_start; k < k_end; ++k) {
+                        int8_t qv = 0;
+                        if (emb_prec == Precision::INT8) {
+                            qv = Fp16Fallback::load_int8_interleaved(embeddings, hidden_dim, idx, k);
+                        } else {
+                            qv = Fp16Fallback::load_int4_interleaved(embeddings, hidden_dim, group_size, idx, k);
+                        }
+                        Fp16Fallback::store_fp16(out_row + k, static_cast<float>(qv) * scale);
+                    }
+                }
+            }
+            return;
+        }
+
+        if (embeddings_buffer.precision == Precision::FP16) {
+            const __fp16* embeddings = embeddings_buffer.data_as<__fp16>();
+            for (size_t i = 0; i < num_indices; ++i) {
+                const size_t idx = static_cast<size_t>(indices_ptr[i]);
+                if (idx >= vocab_size) {
+                    throw std::runtime_error("Embedding index out of bounds: " + std::to_string(idx) + " >= " + std::to_string(vocab_size));
+                }
+                std::memcpy(output + i * hidden_dim, embeddings + idx * hidden_dim, hidden_dim * sizeof(__fp16));
+            }
+            return;
+        }
+
+        throw std::runtime_error("Embedding requires interleaved grouped INT4/INT8 or FP16");
+    }
 
     Precision emb_prec = embeddings_buffer.precision;
     if (PrecisionTraits::is_integer(emb_prec) && embeddings_buffer.group_size > 0) {
@@ -324,10 +404,32 @@ void compute_concat_node(GraphNode& node, const std::vector<std::unique_ptr<Grap
     if (input1_buffer.precision != Precision::FP16) {
         throw std::runtime_error("Concat operation only supports FP16 precision");
     }
-    cactus_concat_f16(input1_buffer.data_as<__fp16>(), input2_buffer.data_as<__fp16>(),
-                     node.output_buffer.data_as<__fp16>(),
-                     shape1.data(), shape2.data(), output_shape.data(),
-                     shape1.size(), node.params.axis);
+    if (cpu_has_fp16_vector_arithmetic()) {
+        cactus_concat_f16(input1_buffer.data_as<__fp16>(), input2_buffer.data_as<__fp16>(),
+            node.output_buffer.data_as<__fp16>(),
+            shape1.data(), shape2.data(), output_shape.data(),
+            shape1.size(), node.params.axis);
+        return;
+    }
+
+    const int axis = node.params.axis;
+    size_t outer = 1;
+    size_t inner = 1;
+    for (int i = 0; i < axis; ++i) outer *= output_shape[static_cast<size_t>(i)];
+    for (size_t i = static_cast<size_t>(axis) + 1; i < output_shape.size(); ++i) inner *= output_shape[i];
+
+    const size_t a_axis = shape1[static_cast<size_t>(axis)];
+    const size_t b_axis = shape2[static_cast<size_t>(axis)];
+    const size_t a_chunk = a_axis * inner;
+    const size_t b_chunk = b_axis * inner;
+    const __fp16* a = input1_buffer.data_as<__fp16>();
+    const __fp16* b = input2_buffer.data_as<__fp16>();
+    __fp16* out = node.output_buffer.data_as<__fp16>();
+
+    for (size_t o = 0; o < outer; ++o) {
+        std::memcpy(out + o * (a_chunk + b_chunk), a + o * a_chunk, a_chunk * sizeof(__fp16));
+        std::memcpy(out + o * (a_chunk + b_chunk) + a_chunk, b + o * b_chunk, b_chunk * sizeof(__fp16));
+    }
 }
 
 void compute_cat_node(
@@ -362,13 +464,36 @@ void compute_cat_node(
         input_shape_ptrs[i] = buffer.shape.data();
     }
 
-    cactus_cat_f16(input_data_ptrs.data(),
-                   node.output_buffer.data_as<__fp16>(),
-                   input_shape_ptrs.data(),
-                   node.output_buffer.shape.data(),
-                   node.input_ids.size(),
-                   node.output_buffer.shape.size(),
-                   node.params.axis);
+    if (cpu_has_fp16_vector_arithmetic()) {
+        cactus_cat_f16(input_data_ptrs.data(),
+            node.output_buffer.data_as<__fp16>(),
+            input_shape_ptrs.data(),
+            node.output_buffer.shape.data(),
+            node.input_ids.size(),
+            node.output_buffer.shape.size(),
+            node.params.axis);
+        return;
+    }
+
+    const size_t axis = static_cast<size_t>(node.params.axis);
+    size_t outer = 1;
+    size_t inner = 1;
+    for (size_t i = 0; i < axis; ++i) outer *= node.output_buffer.shape[i];
+    for (size_t i = axis + 1; i < node.output_buffer.shape.size(); ++i) inner *= node.output_buffer.shape[i];
+
+    __fp16* out = node.output_buffer.data_as<__fp16>();
+    size_t axis_offset = 0;
+    for (size_t inp = 0; inp < node.input_ids.size(); ++inp) {
+        const auto& buf = get_input(node, inp, nodes, node_index_map);
+        const size_t axis_len = buf.shape[axis];
+        const size_t chunk = axis_len * inner;
+        const __fp16* src = buf.data_as<__fp16>();
+        for (size_t o = 0; o < outer; ++o) {
+            const size_t out_base = o * node.output_buffer.shape[axis] * inner + axis_offset * inner;
+            std::memcpy(out + out_base, src + o * chunk, chunk * sizeof(__fp16));
+        }
+        axis_offset += axis_len;
+    }
 }
 
 void compute_index_node(GraphNode& node, const std::vector<std::unique_ptr<GraphNode>>& nodes, const std::unordered_map<size_t, size_t>& node_index_map) {

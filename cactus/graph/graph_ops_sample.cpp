@@ -1,9 +1,12 @@
 #include "graph.h"
+#include "fp16_fallback.h"
 #include "../kernel/kernel.h"
+#include "../kernel/kernel_utils.h"
 #include <cstring>
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <vector>
 
 void compute_sample_node(GraphNode& node, const std::vector<std::unique_ptr<GraphNode>>& nodes, const std::unordered_map<size_t, size_t>& node_index_map) {
     const auto& logits_buffer = get_input(node, 0, nodes, node_index_map);
@@ -29,9 +32,20 @@ void compute_sample_node(GraphNode& node, const std::vector<std::unique_ptr<Grap
 
     if (logits_buffer.precision == Precision::FP16) {
         const __fp16* logits_fp16 = logits_buffer.data_as<__fp16>();
-        cactus_sample_f16_ex(logits_fp16 + last_token_offset, node.output_buffer.data_as<uint32_t>(),
-                             vocab_size, temperature, top_p, min_p, repetition_penalty, top_k, random_seed,
-                             bias_values, bias_indices, bias_count);
+        if (cpu_has_fp16_vector_arithmetic()) {
+            cactus_sample_f16_ex(logits_fp16 + last_token_offset, node.output_buffer.data_as<uint32_t>(),
+                                 vocab_size, temperature, top_p, min_p, repetition_penalty, top_k, random_seed,
+                                 bias_values, bias_indices, bias_count);
+        } else {
+            std::vector<float> logits_fp32(vocab_size);
+            const __fp16* src = logits_fp16 + last_token_offset;
+            for (size_t i = 0; i < vocab_size; ++i) {
+                logits_fp32[i] = Fp16Fallback::load_fp16(src + i);
+            }
+            cactus_sample_f32_ex(logits_fp32.data(), node.output_buffer.data_as<uint32_t>(),
+                                 vocab_size, temperature, top_p, min_p, repetition_penalty, top_k, random_seed,
+                                 bias_values, bias_indices, bias_count);
+        }
     } else {
         const float* logits_fp32 = logits_buffer.data_as<float>();
         cactus_sample_f32_ex(logits_fp32 + last_token_offset, node.output_buffer.data_as<uint32_t>(),
@@ -57,7 +71,7 @@ void compute_topk_node(GraphNode& node, const std::vector<std::unique_ptr<GraphN
     } else if (input_buffer.precision == Precision::FP16) {
         const __fp16* input_fp16 = input_buffer.data_as<__fp16>();
         for (size_t i = 0; i < input_buffer.total_size; ++i) {
-            input_float[i] = static_cast<float>(input_fp16[i]);
+            input_float[i] = Fp16Fallback::load_fp16(input_fp16 + i);
         }
     } else {
         const float* input_fp32 = input_buffer.data_as<float>();

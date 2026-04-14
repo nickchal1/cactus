@@ -1,6 +1,7 @@
 #include "engine.h"
 #include "../models/model.h"
 #include "../graph/graph.h"
+#include "../kernel/kernel_utils.h"
 #include "../npu/npu.h"
 #include <fstream>
 #include <iomanip>
@@ -80,6 +81,12 @@ bool Model::init_internal(CactusGraph* gb, const std::string& model_folder, size
     if (!config_.from_json(config_path)) {
         CACTUS_LOG_ERROR("model", "Model initialization failed - config not loaded from: " << model_folder);
         return false;
+    }
+
+    // On CPUs without ARM FP16 vector arithmetic (e.g. Raspberry Pi 4), graph
+    // execution switches to scalar FP16 fallback paths.
+    if (config_.precision == Config::Precision::FP16 && !cpu_has_fp16_vector_arithmetic()) {
+        CACTUS_LOG_WARN("model", "CPU lacks ARM FP16 vector arithmetic (FEAT_FP16/ASIMDHP); using scalar FP16 fallback kernels.");
     }
 
     std::string vocab_file = model_folder + "/vocab.txt";

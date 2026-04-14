@@ -6,8 +6,10 @@
 #include <TargetConditionals.h>
 #include <sys/sysctl.h>
 #endif
-#if defined(__ANDROID__)
+#if defined(__linux__)
 #include <sys/auxv.h>
+#endif
+#if defined(__ANDROID__)
 #include <asm/hwcap.h>
 #include <sched.h>
 #include <fstream>
@@ -64,6 +66,45 @@ inline bool cpu_has_i8mm() {
     #define HWCAP2_I8MM (1 << 13)
     #endif
     has = (hwcap2 & HWCAP2_I8MM) != 0;
+#endif
+    });
+
+    return has;
+#else
+    return false;
+#endif
+}
+
+inline bool cpu_has_fp16_vector_arithmetic() {
+#if defined(__aarch64__)
+    static std::once_flag once;
+    static bool has = false;
+
+    std::call_once(once, []() {
+#if defined(__APPLE__)
+        int ret = 0;
+        size_t size = sizeof(ret);
+
+        // Preferred modern key.
+        if (sysctlbyname("hw.optional.arm.FEAT_FP16", &ret, &size, nullptr, 0) == 0) {
+            has = (ret == 1);
+            return;
+        }
+
+        // Legacy Apple key used on older Darwin versions.
+        if (sysctlbyname("hw.optional.AdvSIMD_HPFPCvt", &ret, &size, nullptr, 0) == 0) {
+            has = (ret == 1);
+            return;
+        }
+
+        // Apple Silicon devices used by Cactus have FP16 vector arithmetic.
+        has = true;
+#elif defined(__linux__)
+        unsigned long hwcap = getauxval(AT_HWCAP);
+        #ifndef HWCAP_ASIMDHP
+        #define HWCAP_ASIMDHP (1UL << 10)
+        #endif
+        has = (hwcap & HWCAP_ASIMDHP) != 0;
 #endif
     });
 
