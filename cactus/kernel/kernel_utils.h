@@ -71,6 +71,25 @@ inline bool cpu_has_i8mm() {
 #endif
 }
 
+inline bool cpu_has_dotprod() {
+#if defined(__aarch64__) && (defined(__ANDROID__) || defined(__linux__))
+    static std::once_flag once;
+    static bool has = false;
+
+    std::call_once(once, []() {
+        unsigned long hwcap = getauxval(AT_HWCAP);
+#ifdef HWCAP_ASIMDDP
+        has = (hwcap & HWCAP_ASIMDDP) != 0;
+#endif
+    });
+
+    return has;
+#else
+    // Preserve existing behavior on non-Linux targets (e.g. Apple).
+    return true;
+#endif
+}
+
 inline bool cpu_has_sme2() {
 #if defined(__aarch64__)
 	static std::once_flag once;
