@@ -65,9 +65,10 @@ detect_arm_profile_args() {
     fi
 
     if ! has_feature asimdhp; then
-        echo "Error: ARM64 CPU is missing 'asimdhp' (FP16 vector arithmetic)." >&2
-        echo "Cactus local kernels require this feature. Use a newer CPU/device." >&2
-        exit 1
+        echo "Warning: ARM64 CPU is missing 'asimdhp' (FP16 SIMD arithmetic)." >&2
+        echo "- Applying minimal compatibility profile: armv8-a+simd, I8MM OFF, SME2 OFF" >&2
+        echo "-DCACTUS_ARM_BASELINE=armv8-a+simd -DCACTUS_ENABLE_I8MM=OFF -DENABLE_SME2=OFF"
+        return 0
     fi
 
     if ! has_feature asimddp; then

@@ -286,8 +286,12 @@ graph.hard_reset();
 
 ### Raspberry Pi 4 (ARMv8.0) build
 
-The default Cactus baseline is optimized for ARMv8.2+ CPUs.  
-For Raspberry Pi 4, build with a lower baseline and disable I8MM:
+`cactus build` now auto-detects Pi-class ARM features on Linux/aarch64:
+
+- Pi 4 class (no `asimddp`): uses `armv8-a+simd+fp16`, disables I8MM/SME2
+- Pi 5 class (`asimddp` present): keeps optimized default profile
+
+You can still override manually if needed:
 
 ```bash
 CACTUS_CMAKE_ARGS="-DCACTUS_ARM_BASELINE=armv8-a+simd+fp16 -DCACTUS_ENABLE_I8MM=OFF -DENABLE_SME2=OFF" cactus build

@@ -978,10 +978,50 @@ def cmd_run(args):
             return 1
 
     chat_binary = PROJECT_ROOT / "tests" / "build" / "chat"
+    chat_cpp = PROJECT_ROOT / "tests" / "chat.cpp"
 
-    if not chat_binary.exists():
-        print_color(RED, f"Error: Chat binary not found at {chat_binary}")
-        return 1
+    # Rebuild chat if it doesn't exist or if the library is newer (e.g. after
+    # cactus build --python rebuilt the library with a different arch profile).
+    needs_rebuild = not chat_binary.exists()
+    if not needs_rebuild and chat_cpp.exists():
+        needs_rebuild = lib_path.stat().st_mtime > chat_binary.stat().st_mtime
+
+    if needs_rebuild:
+        if not chat_cpp.exists():
+            print_color(RED, f"Error: Chat binary not found at {chat_binary}")
+            return 1
+        print_color(YELLOW, "Rebuilding chat binary against updated library...")
+        is_darwin = platform.system() == "Darwin"
+        compiler = "clang++" if is_darwin else "g++"
+        if not check_command(compiler):
+            print_color(RED, f"Error: {compiler} is not installed")
+            return 1
+        build_dir = PROJECT_ROOT / "tests" / "build"
+        build_dir.mkdir(parents=True, exist_ok=True)
+        if is_darwin:
+            vendored_curl = PROJECT_ROOT / "libs" / "curl" / "macos" / "libcurl.a"
+            compile_cmd = [
+                compiler, "-std=c++20", "-O3",
+                "-DACCELERATE_NEW_LAPACK",
+                f"-I{PROJECT_ROOT}",
+                str(chat_cpp), str(lib_path), "-o", "chat",
+                str(vendored_curl),
+                "-framework", "Accelerate", "-framework", "CoreML",
+                "-framework", "Foundation", "-framework", "Security",
+                "-framework", "SystemConfiguration", "-framework", "CFNetwork",
+            ]
+        else:
+            compile_cmd = [
+                compiler, "-std=c++20", "-O3",
+                f"-I{PROJECT_ROOT}",
+                str(chat_cpp), str(lib_path), "-o", "chat",
+                "-lcurl", "-pthread",
+            ]
+        result = subprocess.run(compile_cmd, cwd=build_dir)
+        if result.returncode != 0:
+            print_color(RED, "Failed to rebuild chat binary")
+            return 1
+        print_color(GREEN, "Chat binary rebuilt successfully")
 
     os.system('clear' if platform.system() != 'Windows' else 'cls')
     print_color(GREEN, f"Starting Cactus Chat with model: {model_id}")

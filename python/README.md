@@ -19,7 +19,9 @@ cactus build --python
 ```
 <!-- --8<-- [end:install] -->
 
-For Raspberry Pi 4 (ARMv8.0), use:
+On Linux/aarch64, `cactus build --python` now auto-detects Pi4 vs Pi5 CPU features.
+
+If you want to force Raspberry Pi 4 compatibility manually, use:
 
 ```bash
 CACTUS_CMAKE_ARGS="-DCACTUS_ARM_BASELINE=armv8-a+simd+fp16 -DCACTUS_ENABLE_I8MM=OFF -DENABLE_SME2=OFF" cactus build --python
