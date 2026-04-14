@@ -110,7 +110,7 @@ inline int8_t sign_extend_int4(uint8_t v) {
 inline int8_t load_int8_interleaved(const int8_t* data, size_t K, size_t n, size_t k) {
     const size_t n_block = n / 4;
     const size_t lane = n % 4;
-    const size_t idx = ((n_block * K + k) * 4) + lane;
+    const size_t idx = (n_block * K * 4) + ((k / 4) * 16) + (lane * 4) + (k % 4);
     return data[idx];
 }
 
@@ -120,15 +120,16 @@ inline int8_t load_int4_interleaved(const int8_t* packed, size_t K, size_t group
     const size_t lane = n % 4;
     const size_t group_idx = k / group_size;
     const size_t in_group = k % group_size;
-    const size_t chunk16 = in_group / 16;
-    const size_t pos = in_group % 16;
 
+    // Layout matches cactus_gemv_int4 / cactus_gemm_int4:
+    //   ba = B_packed + (n_block * K + k_base) * 2
+    //   byte within group = (in_group / 8) * 16 + lane * 4 + (in_group & 3)
+    //   nibble: low if (in_group % 8) < 4, high if (in_group % 8) >= 4
     const size_t group_base = (n_block * K + group_idx * group_size) * 2;
-    const size_t lane_block = (lane >= 2) ? 16 : 0;
-    const size_t byte_idx = group_base + chunk16 * 32 + lane_block + pos;
+    const size_t byte_idx = group_base + (in_group / 8) * 16 + lane * 4 + (in_group & 3);
 
     const uint8_t raw = bytes[byte_idx];
-    const uint8_t nibble = (lane % 2 == 0) ? (raw & 0x0Fu) : (raw >> 4);
+    const uint8_t nibble = ((in_group >> 2) & 1) ? (raw >> 4) : (raw & 0x0Fu);
     return sign_extend_int4(nibble);
 }
 

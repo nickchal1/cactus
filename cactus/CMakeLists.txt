@@ -87,9 +87,15 @@ if(NOT APPLE)
     # Kernel translation units contain explicit FP16 NEON intrinsics.
     # Compile them with FP16 ISA enabled, while higher-level graph/runtime code
     # remains on ARMv8-A baseline and dispatches to scalar fallback when needed.
+    # Disable auto-vectorization here so GCC doesn't opportunistically emit FP16
+    # vector arithmetic in scalar fallback code paths on ARMv8.0 CPUs.
     set(KERNEL_FP16_MARCH_FLAG "-march=armv8.2-a+fp16+simd")
+    set(KERNEL_FP16_COMPILE_OPTIONS
+        "${KERNEL_FP16_MARCH_FLAG}"
+        "-fno-tree-vectorize"
+        "-fno-slp-vectorize")
     foreach(_kernel_src ${KERNEL_SOURCES})
-        set_source_files_properties(${_kernel_src} PROPERTIES COMPILE_OPTIONS "${KERNEL_FP16_MARCH_FLAG}")
+        set_source_files_properties(${_kernel_src} PROPERTIES COMPILE_OPTIONS "${KERNEL_FP16_COMPILE_OPTIONS}")
     endforeach()
 endif()
 

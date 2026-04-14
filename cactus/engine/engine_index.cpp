@@ -1,5 +1,7 @@
 #include "engine.h"
 #include "kernel/kernel.h"
+#include "../graph/fp16_fallback.h"
+#include "../kernel/kernel_utils.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -17,16 +19,39 @@ namespace engine {
 namespace index {
 
     __fp16 dot_product(const __fp16 *a, const __fp16 *b, size_t dim) {
+        if (!cpu_has_fp16_vector_arithmetic()) {
+            float result = 0.0f;
+            for (size_t i = 0; i < dim; ++i) {
+                result += Fp16Fallback::load_fp16(a + i) * Fp16Fallback::load_fp16(b + i);
+            }
+            __fp16 out;
+            Fp16Fallback::store_fp16(&out, result);
+            return out;
+        }
+
         __fp16 result;
         cactus_matmul_f16(a, b, &result, 1, dim, 1);
         return result;
     }
 
     void normalize(__fp16 *v, size_t dim) {
-        __fp16 x = dot_product(v, v, dim);
-        if (x < 1e-6f) {
+        const __fp16 dot = dot_product(v, v, dim);
+        const float squared_norm = Fp16Fallback::load_fp16(&dot);
+        if (squared_norm < 1e-6f) {
             throw std::runtime_error("Cannot normalize zero vector");
         }
+
+        if (!cpu_has_fp16_vector_arithmetic()) {
+            const float inv_norm = 1.0f / std::sqrt(squared_norm);
+            for (size_t i = 0; i < dim; ++i) {
+                const float value = Fp16Fallback::load_fp16(v + i);
+                Fp16Fallback::store_fp16(v + i, value * inv_norm);
+            }
+            return;
+        }
+
+        __fp16 x;
+        Fp16Fallback::store_fp16(&x, squared_norm);
         cactus_scalar_op_f16(&x, &x, 1, 0, ScalarOpType::SQRT);
         cactus_scalar_op_f16(v, v, dim, x, ScalarOpType::DIVIDE);
     }

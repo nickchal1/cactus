@@ -8,11 +8,13 @@
 #endif
 #if defined(__linux__)
 #include <sys/auxv.h>
+#include <fstream>
+#include <sstream>
+#include <cctype>
 #endif
 #if defined(__ANDROID__)
 #include <asm/hwcap.h>
 #include <sched.h>
-#include <fstream>
 #endif
 #include <algorithm>
 #include <cmath>
@@ -34,6 +36,53 @@
 constexpr size_t NEON_VECTOR_SIZE = 16;
 constexpr size_t STREAMING_STORE_THRESHOLD = 32768;
 
+inline bool cactus_env_truthy(const char* value) {
+    return value &&
+           (value[0] == '1' || value[0] == 'y' || value[0] == 'Y' ||
+            value[0] == 't' || value[0] == 'T');
+}
+
+inline bool linux_cpuinfo_has_feature(const char* feature) {
+#if defined(__linux__)
+    std::ifstream cpuinfo("/proc/cpuinfo");
+    if (!cpuinfo.is_open()) {
+        // Fall back to HWCAP-only detection when cpuinfo is unavailable.
+        return true;
+    }
+
+    std::string line;
+    while (std::getline(cpuinfo, line)) {
+        const size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+
+        std::string key = line.substr(0, colon);
+        for (char& c : key) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        key.erase(std::remove_if(key.begin(), key.end(),
+                                 [](unsigned char c) { return std::isspace(c) != 0; }),
+                  key.end());
+        if (key != "features" && key != "flags") continue;
+
+        std::string values = line.substr(colon + 1);
+        for (char& c : values) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+
+        std::istringstream iss(values);
+        std::string token;
+        while (iss >> token) {
+            if (token == feature) return true;
+        }
+    }
+
+    return false;
+#else
+    (void)feature;
+    return false;
+#endif
+}
+
 inline void stream_store_f16x8(__fp16* dst, float16x8_t val) {
 #if defined(__aarch64__)
     float16x4_t lo = vget_low_f16(val);
@@ -50,6 +99,11 @@ inline void stream_store_f16x8(__fp16* dst, float16x8_t val) {
 }
 
 inline bool cpu_has_i8mm() {
+    const char* force_off = std::getenv("CACTUS_FORCE_NO_FP16_VEC");
+    if (cactus_env_truthy(force_off)) {
+        return false;
+    }
+
 #if defined(__aarch64__)
     static std::once_flag once;
     static bool has = false;
@@ -66,7 +120,9 @@ inline bool cpu_has_i8mm() {
     #ifndef HWCAP2_I8MM
     #define HWCAP2_I8MM (1 << 13)
     #endif
-    has = (hwcap2 & HWCAP2_I8MM) != 0;
+    const bool hwcap_has_i8mm = (hwcap2 & HWCAP2_I8MM) != 0;
+    const bool cpuinfo_has_i8mm = linux_cpuinfo_has_feature("i8mm");
+    has = hwcap_has_i8mm && cpuinfo_has_i8mm;
 #endif
     });
 
@@ -78,11 +134,11 @@ inline bool cpu_has_i8mm() {
 
 inline bool cpu_has_fp16_vector_arithmetic() {
     const char* force_off = std::getenv("CACTUS_FORCE_NO_FP16_VEC");
-    if (force_off && (force_off[0] == '1' || force_off[0] == 'y' || force_off[0] == 'Y' || force_off[0] == 't' || force_off[0] == 'T')) {
+    if (cactus_env_truthy(force_off)) {
         return false;
     }
     const char* force_on = std::getenv("CACTUS_FORCE_FP16_VEC");
-    if (force_on && (force_on[0] == '1' || force_on[0] == 'y' || force_on[0] == 'Y' || force_on[0] == 't' || force_on[0] == 'T')) {
+    if (cactus_env_truthy(force_on)) {
         return true;
     }
 
@@ -114,7 +170,9 @@ inline bool cpu_has_fp16_vector_arithmetic() {
         #ifndef HWCAP_ASIMDHP
         #define HWCAP_ASIMDHP (1UL << 10)
         #endif
-        has = (hwcap & HWCAP_ASIMDHP) != 0;
+        const bool hwcap_has_asimdhp = (hwcap & HWCAP_ASIMDHP) != 0;
+        const bool cpuinfo_has_asimdhp = linux_cpuinfo_has_feature("asimdhp");
+        has = hwcap_has_asimdhp && cpuinfo_has_asimdhp;
 #endif
     });
 
@@ -125,6 +183,11 @@ inline bool cpu_has_fp16_vector_arithmetic() {
 }
 
 inline bool cpu_has_sme2() {
+    const char* force_off = std::getenv("CACTUS_FORCE_NO_FP16_VEC");
+    if (cactus_env_truthy(force_off)) {
+        return false;
+    }
+
 #if defined(__aarch64__)
 	static std::once_flag once;
 	static bool has = false;
@@ -139,9 +202,11 @@ inline bool cpu_has_sme2() {
 	}
 
 #elif defined(__ANDROID__) || defined(__linux__)
-	unsigned long hwcap2 = getauxval(AT_HWCAP2);
+		unsigned long hwcap2 = getauxval(AT_HWCAP2);
 #ifdef HWCAP2_SME2
-	has = (hwcap2 & HWCAP2_SME2) != 0;
+		const bool hwcap_has_sme2 = (hwcap2 & HWCAP2_SME2) != 0;
+		const bool cpuinfo_has_sme2 = linux_cpuinfo_has_feature("sme2");
+		has = hwcap_has_sme2 && cpuinfo_has_sme2;
 #endif
 
 #endif
