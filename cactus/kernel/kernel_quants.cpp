@@ -4,6 +4,106 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
+
+namespace {
+
+inline float fp16_bits_to_float(uint16_t h) {
+    const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1Fu;
+    uint32_t mant = h & 0x03FFu;
+
+    uint32_t out_bits = 0;
+    if (exp == 0) {
+        if (mant == 0) {
+            out_bits = sign;
+        } else {
+            int32_t e = -14;
+            while ((mant & 0x0400u) == 0) {
+                mant <<= 1;
+                --e;
+            }
+            mant &= 0x03FFu;
+            out_bits = sign |
+                       static_cast<uint32_t>((e + 127) << 23) |
+                       (mant << 13);
+        }
+    } else if (exp == 0x1Fu) {
+        out_bits = sign | 0x7F800000u | (mant << 13);
+    } else {
+        out_bits = sign |
+                   ((exp + 112u) << 23) |
+                   (mant << 13);
+    }
+
+    float out = 0.0f;
+    std::memcpy(&out, &out_bits, sizeof(out));
+    return out;
+}
+
+inline uint16_t float_to_fp16_bits(float x) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &x, sizeof(bits));
+
+    const uint16_t sign = static_cast<uint16_t>((bits >> 16) & 0x8000u);
+    const uint32_t exp = (bits >> 23) & 0xFFu;
+    const uint32_t mant = bits & 0x7FFFFFu;
+
+    if (exp == 0xFFu) {
+        if (mant != 0) {
+            uint16_t nan_mant = static_cast<uint16_t>(mant >> 13);
+            if (nan_mant == 0) nan_mant = 1;
+            return static_cast<uint16_t>(sign | 0x7C00u | nan_mant);
+        }
+        return static_cast<uint16_t>(sign | 0x7C00u);
+    }
+
+    const int32_t exp_unbiased = static_cast<int32_t>(exp) - 127;
+    int32_t half_exp = exp_unbiased + 15;
+
+    if (half_exp >= 0x1F) {
+        return static_cast<uint16_t>(sign | 0x7C00u);
+    }
+
+    if (half_exp <= 0) {
+        if (half_exp < -10) {
+            return sign;
+        }
+
+        uint32_t mantissa = mant | 0x800000u;
+        const int32_t shift = 14 - half_exp;
+        uint16_t half_mant = static_cast<uint16_t>(mantissa >> shift);
+        const uint32_t round_bit = 1u << (shift - 1);
+        const uint32_t round_mask = round_bit - 1u;
+        if ((mantissa & round_bit) != 0 &&
+            (((mantissa & round_mask) != 0) || ((half_mant & 1u) != 0))) {
+            ++half_mant;
+        }
+        return static_cast<uint16_t>(sign | half_mant);
+    }
+
+    uint16_t half = static_cast<uint16_t>(sign |
+                                          (static_cast<uint16_t>(half_exp) << 10) |
+                                          static_cast<uint16_t>(mant >> 13));
+    if ((mant & 0x1000u) != 0) {
+        ++half;
+    }
+    return half;
+}
+
+inline float load_fp16_scalar(const __fp16* src) {
+    uint16_t bits = 0;
+    std::memcpy(&bits, src, sizeof(bits));
+    return fp16_bits_to_float(bits);
+}
+
+inline void store_fp16_scalar(__fp16* dst, float value) {
+    const uint16_t bits = float_to_fp16_bits(value);
+    std::memcpy(dst, &bits, sizeof(bits));
+}
+
+} // namespace
 
 void cactus_int8_to_fp32(const int8_t* src, float* dst, size_t count, float scale) {
     CactusThreading::parallel_for(count, CactusThreading::Thresholds::ELEMENT_WISE, 
@@ -85,6 +185,16 @@ void cactus_fp32_to_int8(const float* src, int8_t* dst, size_t count, float scal
 }
 
 void cactus_fp16_to_fp32(const __fp16* src, float* dst, size_t count) {
+    if (!cpu_has_fp16_vector_arithmetic()) {
+        CactusThreading::parallel_for(count, CactusThreading::Thresholds::ELEMENT_WISE,
+            [src, dst](size_t start, size_t end) {
+                for (size_t i = start; i < end; ++i) {
+                    dst[i] = load_fp16_scalar(src + i);
+                }
+            });
+        return;
+    }
+
     CactusThreading::parallel_for(count, CactusThreading::Thresholds::ELEMENT_WISE,
         [src, dst](size_t start, size_t end) {
             const size_t simd_end = start + ((end - start) / 8) * 8;
@@ -106,6 +216,16 @@ void cactus_fp16_to_fp32(const __fp16* src, float* dst, size_t count) {
 }
 
 void cactus_fp32_to_fp16(const float* src, __fp16* dst, size_t count) {
+    if (!cpu_has_fp16_vector_arithmetic()) {
+        CactusThreading::parallel_for(count, CactusThreading::Thresholds::ELEMENT_WISE,
+            [src, dst](size_t start, size_t end) {
+                for (size_t i = start; i < end; ++i) {
+                    store_fp16_scalar(dst + i, src[i]);
+                }
+            });
+        return;
+    }
+
     CactusThreading::parallel_for(count, CactusThreading::Thresholds::ELEMENT_WISE,
         [src, dst](size_t start, size_t end) {
             const size_t simd_end = start + ((end - start) / 8) * 8;
@@ -128,6 +248,16 @@ void cactus_fp32_to_fp16(const float* src, __fp16* dst, size_t count) {
 }
 
 void cactus_int8_to_fp16(const int8_t* src, __fp16* dst, size_t count, float scale) {
+    if (!cpu_has_fp16_vector_arithmetic()) {
+        CactusThreading::parallel_for(count, CactusThreading::Thresholds::ELEMENT_WISE,
+            [src, dst, scale](size_t start, size_t end) {
+                for (size_t i = start; i < end; ++i) {
+                    store_fp16_scalar(dst + i, static_cast<float>(src[i]) * scale);
+                }
+            });
+        return;
+    }
+
     CactusThreading::parallel_for(count, CactusThreading::Thresholds::ELEMENT_WISE,
         [src, dst, scale](size_t start, size_t end) {
             const size_t simd_end = start + ((end - start) / 8) * 8;
@@ -157,6 +287,18 @@ void cactus_int8_to_fp16(const int8_t* src, __fp16* dst, size_t count, float sca
 }
 
 void cactus_fp16_to_int8(const __fp16* src, int8_t* dst, size_t count, float scale) {
+    if (!cpu_has_fp16_vector_arithmetic()) {
+        const float inv_scale = 1.0f / scale;
+        CactusThreading::parallel_for(count, CactusThreading::Thresholds::ELEMENT_WISE,
+            [src, dst, inv_scale](size_t start, size_t end) {
+                for (size_t i = start; i < end; ++i) {
+                    float quantized = load_fp16_scalar(src + i) * inv_scale;
+                    dst[i] = static_cast<int8_t>(std::round(std::max(-128.0f, std::min(127.0f, quantized))));
+                }
+            });
+        return;
+    }
+
     const float inv_scale = 1.0f / scale;
     
     CactusThreading::parallel_for(count, CactusThreading::Thresholds::ELEMENT_WISE,
@@ -195,6 +337,15 @@ void cactus_fp16_to_int8(const __fp16* src, int8_t* dst, size_t count, float sca
 }
 
 float cactus_fp16_max_abs(const __fp16* src, size_t count) {
+    if (!cpu_has_fp16_vector_arithmetic()) {
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < count; ++i) {
+            float abs_val = std::abs(load_fp16_scalar(src + i));
+            max_abs = std::max(max_abs, abs_val);
+        }
+        return max_abs;
+    }
+
     float32x4_t abs_max_vec = vdupq_n_f32(0.0f);
     const size_t simd_end = (count / 8) * 8;
 
@@ -222,6 +373,26 @@ float cactus_fp16_max_abs(const __fp16* src, size_t count) {
 }
 
 static inline float quantize_group_fp16_to_int8(const __fp16* src, int8_t* dst, size_t count) {
+    if (!cpu_has_fp16_vector_arithmetic()) {
+        float max_abs = 0.0f;
+        for (size_t k = 0; k < count; k++) {
+            float val = std::abs(load_fp16_scalar(src + k));
+            if (val > max_abs) max_abs = val;
+        }
+
+        float scale = max_abs / 127.0f;
+        if (scale < 1e-10f) scale = 1e-10f;
+        float inv_scale = 1.0f / scale;
+
+        for (size_t k = 0; k < count; k++) {
+            float val = load_fp16_scalar(src + k) * inv_scale;
+            int32_t q = static_cast<int32_t>(roundf(val));
+            q = std::max(-128, std::min(127, q));
+            dst[k] = static_cast<int8_t>(q);
+        }
+
+        return scale;
+    }
 
     float32x4_t max_vec = vdupq_n_f32(0.0f);
     size_t k = 0;

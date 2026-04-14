@@ -29,6 +29,7 @@
 #include <chrono>
 #include <string>
 #include <cstdio>
+#include <cstdlib>
 
 constexpr size_t NEON_VECTOR_SIZE = 16;
 constexpr size_t STREAMING_STORE_THRESHOLD = 32768;
@@ -60,7 +61,7 @@ inline bool cpu_has_i8mm() {
     if (sysctlbyname("hw.optional.arm.FEAT_I8MM", &ret, &size, nullptr, 0) == 0) {
         has = (ret == 1);
     }
-#elif defined(__ANDROID__)
+#elif defined(__ANDROID__) || defined(__linux__)
     unsigned long hwcap2 = getauxval(AT_HWCAP2);
     #ifndef HWCAP2_I8MM
     #define HWCAP2_I8MM (1 << 13)
@@ -76,6 +77,15 @@ inline bool cpu_has_i8mm() {
 }
 
 inline bool cpu_has_fp16_vector_arithmetic() {
+    const char* force_off = std::getenv("CACTUS_FORCE_NO_FP16_VEC");
+    if (force_off && (force_off[0] == '1' || force_off[0] == 'y' || force_off[0] == 'Y' || force_off[0] == 't' || force_off[0] == 'T')) {
+        return false;
+    }
+    const char* force_on = std::getenv("CACTUS_FORCE_FP16_VEC");
+    if (force_on && (force_on[0] == '1' || force_on[0] == 'y' || force_on[0] == 'Y' || force_on[0] == 't' || force_on[0] == 'T')) {
+        return true;
+    }
+
 #if defined(__aarch64__)
     static std::once_flag once;
     static bool has = false;
@@ -128,7 +138,7 @@ inline bool cpu_has_sme2() {
 		has = ret == 1;
 	}
 
-#elif defined(__ANDROID__)
+#elif defined(__ANDROID__) || defined(__linux__)
 	unsigned long hwcap2 = getauxval(AT_HWCAP2);
 #ifdef HWCAP2_SME2
 	has = (hwcap2 & HWCAP2_SME2) != 0;
