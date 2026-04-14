@@ -1132,6 +1132,9 @@ void compute_attention_int8_hybrid_node(GraphNode& node, const std::vector<std::
     size_t num_q_heads = q_shape[2];
     size_t head_dim = node.params.head_dim;
     size_t v_head_dim = node.params.v_head_dim;
+    if (v_head_dim == 0) {
+        v_head_dim = head_dim;
+    }
     size_t num_kv_heads = node.params.num_kv_heads;
     size_t cache_len = node.params.cache_seq_len;
     size_t new_len = key_new_buffer.shape[1];
@@ -2707,9 +2710,49 @@ void compute_rope_gptj_node(GraphNode& node, const std::vector<std::unique_ptr<G
     size_t head_dim = shape[3];
     size_t rot_dim = static_cast<size_t>(node.params.scalar);
 
-    cactus_gpt_j_rope_f16(input_buffer.data_as<__fp16>(), node.output_buffer.data_as<__fp16>(),
-                          batch_size, seq_len, num_heads, head_dim, rot_dim,
-                          node.params.position_offset, node.params.theta);
+    if (has_fp16_vec()) {
+        cactus_gpt_j_rope_f16(input_buffer.data_as<__fp16>(), node.output_buffer.data_as<__fp16>(),
+                              batch_size, seq_len, num_heads, head_dim, rot_dim,
+                              node.params.position_offset, node.params.theta);
+        return;
+    }
+
+    if (rot_dim > head_dim) {
+        throw std::runtime_error("ROPE_GPTJ rot_dim cannot exceed head_dim");
+    }
+    if ((rot_dim % 2) != 0) {
+        throw std::runtime_error("ROPE_GPTJ rot_dim must be even");
+    }
+
+    const __fp16* input = input_buffer.data_as<__fp16>();
+    __fp16* output = node.output_buffer.data_as<__fp16>();
+    const size_t half_rot_dim = rot_dim / 2;
+
+    for (size_t b = 0; b < batch_size; ++b) {
+        for (size_t t = 0; t < seq_len; ++t) {
+            const size_t pos = node.params.position_offset + t;
+            for (size_t h = 0; h < num_heads; ++h) {
+                const size_t base = ((b * seq_len + t) * num_heads + h) * head_dim;
+
+                // GPT-J style RoPE rotates interleaved pairs [x0, x1], [x2, x3], ...
+                for (size_t i = 0; i < half_rot_dim; ++i) {
+                    const float exponent = (2.0f * static_cast<float>(i)) / static_cast<float>(rot_dim);
+                    const float inv_freq = std::pow(node.params.theta, -exponent);
+                    const float angle = static_cast<float>(pos) * inv_freq;
+                    const float c = std::cos(angle);
+                    const float s = std::sin(angle);
+                    const float x0 = Fp16Fallback::load_fp16(input + base + (2 * i));
+                    const float x1 = Fp16Fallback::load_fp16(input + base + (2 * i + 1));
+                    Fp16Fallback::store_fp16(output + base + (2 * i), x0 * c - x1 * s);
+                    Fp16Fallback::store_fp16(output + base + (2 * i + 1), x1 * c + x0 * s);
+                }
+
+                for (size_t i = rot_dim; i < head_dim; ++i) {
+                    Fp16Fallback::store_fp16(output + base + i, Fp16Fallback::load_fp16(input + base + i));
+                }
+            }
+        }
+    }
 }
 
 void compute_groupnorm_node(GraphNode& node, const std::vector<std::unique_ptr<GraphNode>>& nodes,
