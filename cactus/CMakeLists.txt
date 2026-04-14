@@ -83,6 +83,16 @@ set(I8MM_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/kernel/kernel_i8mm.cpp")
 list(REMOVE_ITEM KERNEL_SOURCES "${SME2_SOURCE}")
 list(REMOVE_ITEM KERNEL_SOURCES "${I8MM_SOURCE}")
 
+if(NOT APPLE)
+    # Kernel translation units contain explicit FP16 NEON intrinsics.
+    # Compile them with FP16 ISA enabled, while higher-level graph/runtime code
+    # remains on ARMv8-A baseline and dispatches to scalar fallback when needed.
+    set(KERNEL_FP16_MARCH_FLAG "-march=armv8.2-a+fp16+simd")
+    foreach(_kernel_src ${KERNEL_SOURCES})
+        set_source_files_properties(${_kernel_src} PROPERTIES COMPILE_OPTIONS "${KERNEL_FP16_MARCH_FLAG}")
+    endforeach()
+endif()
+
 if(APPLE)
     set(NPU_SOURCES "npu/npu_ane.mm")
     set_source_files_properties(npu/npu_ane.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
