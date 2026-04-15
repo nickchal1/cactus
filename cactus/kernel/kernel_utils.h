@@ -182,6 +182,17 @@ inline bool cpu_has_fp16_vector_arithmetic() {
 #endif
 }
 
+// All AArch64 CPUs have baseline NEON (FP32/INT SIMD + FP16 load/store/convert).
+// This gate covers kernels that do NOT use FP16 arithmetic (FEAT_FP16/ASIMDHP),
+// so they run on ARMv8.0-A parts like the Raspberry Pi 4 Cortex-A72.
+inline bool cpu_has_neon() {
+#if defined(__aarch64__)
+    return true;
+#else
+    return false;
+#endif
+}
+
 inline bool cpu_has_sme2() {
     const char* force_off = std::getenv("CACTUS_FORCE_NO_FP16_VEC");
     if (cactus_env_truthy(force_off)) {

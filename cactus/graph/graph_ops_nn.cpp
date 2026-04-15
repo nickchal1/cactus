@@ -46,7 +46,8 @@ namespace {
         }
 
         constexpr size_t PARALLEL_THRESHOLD = 16;
-        const bool use_vec = has_fp16_vec();
+        // All baseline-NEON kernels (fp16 load/convert + int SIMD) run on ARMv8.0-A.
+        const bool use_vec = cpu_has_neon();
 
         if (M >= PARALLEL_THRESHOLD) {
             CactusThreading::parallel_for(M, CactusThreading::Thresholds::ELEMENT_WISE,
@@ -88,7 +89,7 @@ namespace {
         }
         if (buffer.precision == Precision::FP32) {
             scratch.resize(buffer.total_size);
-            if (has_fp16_vec()) {
+            if (cpu_has_neon()) {
                 cactus_fp32_to_fp16(buffer.data_as<float>(), scratch.data(), buffer.total_size);
             } else {
                 const float* src = buffer.data_as<float>();
@@ -274,11 +275,18 @@ void compute_matmul_node(GraphNode& node, const std::vector<std::unique_ptr<Grap
                 lhs_scales = lhs_buffer.activation_scales_as_float();
             } else if (lhs_buffer.precision == Precision::FP16) {
                 ensure_quant_buffers(M, K);
-                for (size_t m = 0; m < M; ++m) {
-                    quant_scales_buffer[m] = Fp16Fallback::quantize_row_fp16_to_int8(
-                        lhs_buffer.data_as<__fp16>() + m * K,
-                        quant_activation_buffer.data() + m * K,
-                        K);
+                if (cpu_has_neon()) {
+                    // Use NEON-accelerated quantization (baseline ARMv8.0-A safe).
+                    cached_quant_src = nullptr;
+                    quantize_activations_fp16_to_int8(lhs_buffer.data_as<__fp16>(), quant_activation_buffer.data(),
+                                                      quant_scales_buffer.data(), M, K);
+                } else {
+                    for (size_t m = 0; m < M; ++m) {
+                        quant_scales_buffer[m] = Fp16Fallback::quantize_row_fp16_to_int8(
+                            lhs_buffer.data_as<__fp16>() + m * K,
+                            quant_activation_buffer.data() + m * K,
+                            K);
+                    }
                 }
                 lhs_int8 = quant_activation_buffer.data();
                 lhs_scales = quant_scales_buffer.data();
@@ -286,23 +294,32 @@ void compute_matmul_node(GraphNode& node, const std::vector<std::unique_ptr<Grap
                 throw std::runtime_error("Quantized matmul requires INT8 (pre-quantized) or FP16 activations");
             }
 
-            for (size_t m = 0; m < M; ++m) {
-                const int8_t* a_row = lhs_int8 + m * K;
-                const float a_scale = lhs_scales[m];
-                for (size_t n = 0; n < N; ++n) {
-                    float sum = 0.0f;
-                    for (size_t k = 0; k < K; ++k) {
-                        const size_t g = k / group_size;
-                        const float w_scale = Fp16Fallback::load_group_scale(rhs_scales, num_groups, n, g);
-                        int8_t w_q = 0;
-                        if (rhs_buffer.precision == Precision::INT8) {
-                            w_q = Fp16Fallback::load_int8_interleaved(rhs, K, n, k);
-                        } else {
-                            w_q = Fp16Fallback::load_int4_interleaved(rhs, K, group_size, n, k);
+            if (cpu_has_neon()) {
+                // Use NEON-accelerated integer matmul (baseline ARMv8.0-A safe; no
+                // FP16 arithmetic — only FP16 load/convert intrinsics are used).
+                cactus_matmul_integer(rhs_buffer.precision,
+                                lhs_int8, lhs_scales,
+                                rhs, rhs_scales, output,
+                                M, K, N, rhs_buffer.group_size);
+            } else {
+                for (size_t m = 0; m < M; ++m) {
+                    const int8_t* a_row = lhs_int8 + m * K;
+                    const float a_scale = lhs_scales[m];
+                    for (size_t n = 0; n < N; ++n) {
+                        float sum = 0.0f;
+                        for (size_t k = 0; k < K; ++k) {
+                            const size_t g = k / group_size;
+                            const float w_scale = Fp16Fallback::load_group_scale(rhs_scales, num_groups, n, g);
+                            int8_t w_q = 0;
+                            if (rhs_buffer.precision == Precision::INT8) {
+                                w_q = Fp16Fallback::load_int8_interleaved(rhs, K, n, k);
+                            } else {
+                                w_q = Fp16Fallback::load_int4_interleaved(rhs, K, group_size, n, k);
+                            }
+                            sum += static_cast<float>(a_row[k]) * static_cast<float>(w_q) * w_scale;
                         }
-                        sum += static_cast<float>(a_row[k]) * static_cast<float>(w_q) * w_scale;
+                        Fp16Fallback::store_fp16(output + m * N + n, sum * a_scale);
                     }
-                    Fp16Fallback::store_fp16(output + m * N + n, sum * a_scale);
                 }
             }
             return;

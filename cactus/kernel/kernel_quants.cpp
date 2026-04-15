@@ -185,7 +185,7 @@ void cactus_fp32_to_int8(const float* src, int8_t* dst, size_t count, float scal
 }
 
 void cactus_fp16_to_fp32(const __fp16* src, float* dst, size_t count) {
-    if (!cpu_has_fp16_vector_arithmetic()) {
+    if (!cpu_has_neon()) {
         CactusThreading::parallel_for(count, CactusThreading::Thresholds::ELEMENT_WISE,
             [src, dst](size_t start, size_t end) {
                 for (size_t i = start; i < end; ++i) {
@@ -216,7 +216,7 @@ void cactus_fp16_to_fp32(const __fp16* src, float* dst, size_t count) {
 }
 
 void cactus_fp32_to_fp16(const float* src, __fp16* dst, size_t count) {
-    if (!cpu_has_fp16_vector_arithmetic()) {
+    if (!cpu_has_neon()) {
         CactusThreading::parallel_for(count, CactusThreading::Thresholds::ELEMENT_WISE,
             [src, dst](size_t start, size_t end) {
                 for (size_t i = start; i < end; ++i) {
@@ -248,7 +248,7 @@ void cactus_fp32_to_fp16(const float* src, __fp16* dst, size_t count) {
 }
 
 void cactus_int8_to_fp16(const int8_t* src, __fp16* dst, size_t count, float scale) {
-    if (!cpu_has_fp16_vector_arithmetic()) {
+    if (!cpu_has_neon()) {
         CactusThreading::parallel_for(count, CactusThreading::Thresholds::ELEMENT_WISE,
             [src, dst, scale](size_t start, size_t end) {
                 for (size_t i = start; i < end; ++i) {
@@ -287,7 +287,7 @@ void cactus_int8_to_fp16(const int8_t* src, __fp16* dst, size_t count, float sca
 }
 
 void cactus_fp16_to_int8(const __fp16* src, int8_t* dst, size_t count, float scale) {
-    if (!cpu_has_fp16_vector_arithmetic()) {
+    if (!cpu_has_neon()) {
         const float inv_scale = 1.0f / scale;
         CactusThreading::parallel_for(count, CactusThreading::Thresholds::ELEMENT_WISE,
             [src, dst, inv_scale](size_t start, size_t end) {
@@ -337,7 +337,7 @@ void cactus_fp16_to_int8(const __fp16* src, int8_t* dst, size_t count, float sca
 }
 
 float cactus_fp16_max_abs(const __fp16* src, size_t count) {
-    if (!cpu_has_fp16_vector_arithmetic()) {
+    if (!cpu_has_neon()) {
         float max_abs = 0.0f;
         for (size_t i = 0; i < count; ++i) {
             float abs_val = std::abs(load_fp16_scalar(src + i));
@@ -373,7 +373,7 @@ float cactus_fp16_max_abs(const __fp16* src, size_t count) {
 }
 
 static inline float quantize_group_fp16_to_int8(const __fp16* src, int8_t* dst, size_t count) {
-    if (!cpu_has_fp16_vector_arithmetic()) {
+    if (!cpu_has_neon()) {
         float max_abs = 0.0f;
         for (size_t k = 0; k < count; k++) {
             float val = std::abs(load_fp16_scalar(src + k));
